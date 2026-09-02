@@ -1,4 +1,4 @@
-/* Visual Memory Agent dashboard — vanilla JS, no build step. */
+/* Memoria Vitae dashboard — vanilla JS, no build step. */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);

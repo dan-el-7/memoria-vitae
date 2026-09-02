@@ -162,7 +162,7 @@ class SensorService : Service(), LifecycleOwner {
         val channelId = "vma_sensor"
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
-            NotificationChannel(channelId, "Visual Memory Sensor", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(channelId, "Memoria Vitae Sensor", NotificationManager.IMPORTANCE_LOW)
         )
         val notification: Notification = Notification.Builder(this, channelId)
             .setContentTitle("VMA Sensor active")

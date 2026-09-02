@@ -10,7 +10,7 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-echo Starting Visual Memory Agent at http://localhost:8619
+echo Starting Memoria Vitae at http://localhost:8619
 echo Press Ctrl+C to stop the desktop server.
 ".venv\Scripts\python.exe" -m uvicorn vma.app:app --host 0.0.0.0 --port 8619
 

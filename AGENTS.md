@@ -1,4 +1,4 @@
-# AGENTS.md — Visual Memory & Analysis Agent (VMA)
+# AGENTS.md — Memoria Vitae (internal short name: vma)
 
 Guidance for AI coding agents working in this repo. Read this first; deeper detail
 lives in `docs/` (see the map at the bottom).

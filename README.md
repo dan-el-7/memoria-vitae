@@ -1,4 +1,4 @@
-# VMA — Visual Memory & Analysis Agent
+# Memoria Vitae
 
 Turn an old Android phone into a **private, continuous visual memory**. The phone
 streams ~1 fps camera frames to your desktop over WebSocket; a small local vision
@@ -9,6 +9,9 @@ you saw** ("where was the calculator at 3pm?", "summarize my afternoon").
 Everything runs **local-first** (Ollama by default). No data leaves the machine
 unless you explicitly configure a cloud provider for a stage — and the UI tells
 you when you did.
+
+> The codebase internally uses the short name `vma` (Python package, Android
+> package `dev.vma.sensor`, config file) — that's this project.
 
 ```
 phone (CameraX, foreground service)

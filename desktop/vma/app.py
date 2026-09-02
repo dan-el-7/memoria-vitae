@@ -205,7 +205,7 @@ def save_config_toml(cfg: AppConfig) -> None:
         ]
         return "\n".join(lines)
 
-    content = f"""# Visual Memory Agent configuration (auto-saved)
+    content = f"""# Memoria Vitae configuration (auto-saved)
 ollama_url = "{cfg.ollama_url}"
 
 [vision]
@@ -303,7 +303,7 @@ async def lifespan(app: FastAPI):
         state.current_run.close()
 
 
-app = FastAPI(title="Visual Memory Agent", lifespan=lifespan)
+app = FastAPI(title="Memoria Vitae", lifespan=lifespan)
 
 
 # ------------------------------------------------------------- basic routes
