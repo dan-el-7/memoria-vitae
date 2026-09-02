@@ -1,11 +1,15 @@
 # Memoria Vitae
 
 Turn an old Android phone into a **private, continuous visual memory**. The phone
-streams ~1 <small><sub>(planned to be user chosen eventually, currently it is adaptive and slows down capture times if avg inference is running behind)</small></sub> fps camera frames to your desktop over WebSocket; a small local vision
+streams ~1 fps[^fps] camera frames to your desktop over WebSocket; a small local vision
 model (VLM) converts each frame into structured observations; everything is stored
 in a per-run SQLite database; and a local reasoning LLM lets you **chat with what
 you saw** ("where was the calculator at 3pm?", "summarize my afternoon").
 
+[^fps]:
+    Currently adaptive, the capture interval automatically slows down when
+    average inference runs behind. User-chosen pace are planned.
+    
 Everything runs **local-first** (Ollama by default). No data leaves the machine
 unless you explicitly configure a cloud provider for a stage — and the UI tells
 you when you did.
@@ -33,6 +37,7 @@ WebSocket ──► bounded intake (cap 3, latest-frame-wins)
   the desktop acks *every* frame (duplicates included) and recommends a capture
   interval from measured VLM latency (EMA). Bounded intake with
   latest-frame-wins, so a slow VLM yields fresh frames, not a stale queue.
+  Skips duplicate frames via a cheap check to avoid wasting power on unnecessary inference.
 - **Visual memory, chronological by design** — committed observations are never
   merged or deleted for being similar; similarity only *links* and *ranks*.
   Temporal history is the product.
@@ -53,6 +58,7 @@ WebSocket ──► bounded intake (cap 3, latest-frame-wins)
   ask-the-agent / browse any past run).
 - **Cross-platform desktop** — Windows/Linux/macOS (pure Python + pathlib;
   platform launchers and env-var config).
+- **Pretty easy to run** — I tested this on a 5050, it can hit 3s~ per inference which is reliable enough to not skip most important stuff and pretty accessible. Models used in my testing were qwen3-vl:2b and an abliterated version of Qwen3 to avoid random refusals and lower VRAM usage for similar intelligence. Might have even more accessible options assuming hallucinations don't get bad ([see where this is going →](#qnn))
 
 ## Quickstart
 
@@ -127,8 +133,9 @@ cd desktop && .venv/bin/python -m pytest ../tests -q        # Linux/macOS
 
 ## Future
 
-- Might try out stuff like pure mobile inference if the Hexagon NPU can have a decent tps when the model is converted to QNN, efficiency is also something to watch out for on handheld devices. (Would also likely need 12GB=< ram if not more, especially for the querying to have a decent model.)
+- <a id="qnn"></a>Might try out stuff like pure mobile inference if the Hexagon NPU can have a decent tps when the model is converted to QNN, efficiency is also something to watch out for on handheld devices. (Would also likely need 12GB=< ram if not more, especially for the querying to have a decent model.)
 - Authenticated over the Internet, not just local Wi-Fi.
+- Definitely forgetting something and will get random ideas :( Memory Gacha!
 
 ## Similar Work
 Found this after doing much of the work on this random idea I had, pretty similar and has useful insights: https://arxiv.org/html/2607.11487v1
