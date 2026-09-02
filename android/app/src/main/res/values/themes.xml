@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.VmaSensor" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:statusBarColor">#0f1115</item>
+    </style>
+</resources>

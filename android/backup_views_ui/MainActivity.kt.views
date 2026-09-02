@@ -1,0 +1,397 @@
+package dev.vma.sensor
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
+import android.graphics.SurfaceTexture
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Size
+import android.view.Surface
+import android.view.TextureView
+import android.widget.Button
+import android.widget.ImageView
+import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
+import androidx.camera.core.Preview
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import org.json.JSONObject
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var store: DeviceStore
+    private lateinit var pairedLabel: TextView
+    private lateinit var statusText: TextView
+    private lateinit var statsText: TextView
+    private lateinit var startButton: Button
+    private lateinit var stopButton: Button
+    private lateinit var previewToggle: SwitchCompat
+    private lateinit var previewView: TextureView
+    private val uiRefresher = Handler(Looper.getMainLooper())
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        store = DeviceStore(this)
+
+        pairedLabel = findViewById(R.id.pairedLabel)
+        statusText = findViewById(R.id.statusText)
+        statsText = findViewById(R.id.statsText)
+        startButton = findViewById(R.id.startButton)
+        stopButton = findViewById(R.id.stopButton)
+        previewToggle = findViewById(R.id.previewToggle)
+        previewView = findViewById(R.id.previewView)
+
+        findViewById<android.widget.EditText>(R.id.serverUrl).setText(store.serverUrl)
+
+        findViewById<Button>(R.id.pairButton).setOnClickListener { pair() }
+        startButton.setOnClickListener { startSensing() }
+        stopButton.setOnClickListener { SensorService.stop(this) }
+
+        // Local preview: CameraX Preview use case rendered on THIS screen only.
+        // It never touches the WS frame path (no acks, no intake, no VLM wait).
+        previewToggle.setOnCheckedChangeListener { _, checked ->
+            if (checked) {
+                if (!hasPermission(Manifest.permission.CAMERA)) {
+                    previewToggle.isChecked = false
+                    requestPermissions()
+                    return@setOnCheckedChangeListener
+                }
+                previewView.visibility = android.view.View.VISIBLE
+                SensorService.setLocalPreview(previewSurfaceProvider())
+                if (SensorService.instance == null) toast("Start the sensor to open the camera")
+            } else {
+                previewView.visibility = android.view.View.GONE
+                SensorService.setLocalPreview(null)
+            }
+        }
+
+        // Remote commands (desktop enforces the allowlist; token = pairing auth)
+        findViewById<Button>(R.id.btnCmdStatus).setOnClickListener {
+            sendCommand("get_status", JSONObject())
+        }
+        findViewById<Button>(R.id.btnCmdPause).setOnClickListener {
+            sendCommand("pause", JSONObject())
+        }
+        findViewById<Button>(R.id.btnCmdResume).setOnClickListener {
+            sendCommand("resume", JSONObject())
+        }
+        findViewById<Button>(R.id.btnAskAgent).setOnClickListener {
+            val text = findViewById<android.widget.EditText>(R.id.commandText).text.toString().trim()
+            if (text.isEmpty()) {
+                toast("Type a question first")
+            } else {
+                findViewById<android.widget.EditText>(R.id.commandText).setText("")
+                sendCommand("chat", commandArgs().put("text", text))
+            }
+        }
+        findViewById<Button>(R.id.btnRecentObs).setOnClickListener {
+            sendCommand("get_observations", commandArgs().put("limit", 10))
+        }
+        findViewById<Button>(R.id.btnLastImage).setOnClickListener { fetchLastImage() }
+        findViewById<Button>(R.id.btnLoadRuns).setOnClickListener {
+            sendCommand("list_runs", JSONObject())
+        }
+
+        handleDeepLink(intent)
+    }
+
+    /** Command args carry the selected run so past runs are first-class on
+     *  the phone (list_runs + run_id support on the desktop). */
+    private fun commandArgs(): JSONObject {
+        val args = JSONObject()
+        selectedRunId?.let { args.put("run_id", it) }
+        return args
+    }
+
+    /** No camera-view dependency (offline build): feed CameraX a Surface made
+     *  from a fresh SurfaceTexture per request and hand it to the TextureView. */
+    private fun previewSurfaceProvider(): Preview.SurfaceProvider {
+        return Preview.SurfaceProvider { request ->
+            val resolution: Size = request.resolution
+            val texture = SurfaceTexture(0).apply {
+                setDefaultBufferSize(resolution.width, resolution.height)
+            }
+            runOnUiThread {
+                previewView.setSurfaceTexture(texture)
+            }
+            val surface = Surface(texture)
+            request.provideSurface(surface, ContextCompat.getMainExecutor(this)) { }
+        }
+    }
+
+    private fun sendCommand(command: String, args: JSONObject) {
+        val serverUrl = store.serverUrl
+        val token = store.deviceToken
+        val resultView = findViewById<TextView>(R.id.commandResult)
+        resultView.text = "… $command"
+        Thread {
+            val result = CommandClient.send(serverUrl, token, command, args)
+            runOnUiThread {
+                if (!result.ok) {
+                    resultView.text = "✗ $command: ${result.message}"
+                    return@runOnUiThread
+                }
+                when (command) {
+                    "get_status" -> resultView.text = pretty(result.message).ifBlank { "ok" }
+                    "chat" -> resultView.text = try {
+                        JSONObject(result.message).optString("answer").ifBlank { "(empty answer)" }
+                    } catch (_: Exception) { result.message }
+                    "list_runs" -> renderRuns(result.message)
+                    "get_observations" -> renderObsList(result.message)
+                    "get_observation_image" -> showObservationImage(result.message)
+                    else -> resultView.text = result.message.ifBlank { "ok" }
+                }
+            }
+        }.start()
+    }
+
+    private var cachedObs: List<JSONObject> = emptyList()
+    private var selectedRunId: String? = null
+    private var runIds: List<String> = emptyList()
+
+    /** Pull all desktop runs into the dropdown; the selection scopes Recent
+     *  obs / Last image / Ask agent to that run (blank/default = active run). */
+    private fun renderRuns(json: String) {
+        try {
+            val list = JSONObject(json).optJSONArray("runs") ?: return
+            val labels = mutableListOf("<active run>")
+            val ids = mutableListOf<String?>(null)
+            for (i in 0 until list.length()) {
+                val r = list.getJSONObject(i)
+                labels.add(
+                    (if (r.optBoolean("active")) "● " else "") +
+                        (r.optString("name").ifBlank { r.optString("run_id") }) +
+                        " · " + r.optString("created_at").let { if (it.length >= 10) it.take(10) else "?" } +
+                        " · " + r.optDouble("size_mb", 0.0) + " MB"
+                )
+                ids.add(r.optString("run_id"))
+            }
+            runIds = ids.filterNotNull()
+            val spinner = findViewById<android.widget.Spinner>(R.id.runSpinner)
+            spinner.adapter = android.widget.ArrayAdapter(
+                this, android.R.layout.simple_spinner_item, labels
+            ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+            spinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: android.widget.AdapterView<*>, view: android.view.View?, pos: Int, id: Long) {
+                    selectedRunId = ids.getOrNull(pos)
+                }
+                override fun onNothingSelected(parent: android.widget.AdapterView<*>) {}
+            }
+            findViewById<TextView>(R.id.commandResult).text =
+                "${list.length()} run(s) — pick one above, then Recent obs / Last image / Ask"
+        } catch (e: Exception) {
+            findViewById<TextView>(R.id.commandResult).text = "✗ runs: ${e.message}"
+        }
+    }
+
+    /** Show the run's latest observations; remember them so "Last image" can
+     *  request the most recent one that actually has a retained image. */
+    private fun renderObsList(json: String) {
+        try {
+            val list = JSONObject(json).optJSONArray("observations") ?: return
+            val items = (0 until list.length()).map { list.getJSONObject(it) }
+            cachedObs = items
+            findViewById<ImageView>(R.id.commandImage).visibility = android.view.View.GONE
+            findViewById<TextView>(R.id.commandResult).text =
+                if (items.isEmpty()) "no observations yet"
+                else items.joinToString("\n") { o ->
+                    val hhmm = o.optString("ts").let { if (it.length >= 16) it.substring(11, 16) else it }
+                    "${o.optInt("id")} · $hhmm · imp${o.optInt("importance")} · ${o.optString("summary")}"
+                }
+        } catch (e: Exception) {
+            findViewById<TextView>(R.id.commandResult).text = "✗ parse: ${e.message}"
+        }
+    }
+
+    private fun fetchLastImage() {
+        val candidate = cachedObs.firstOrNull { !it.optString("media").isNullOrBlank() }
+        if (candidate == null) {
+            findViewById<TextView>(R.id.commandResult).text =
+                "no retained images — tap Recent obs first (storage policy may keep none)"
+            return
+        }
+        sendCommand("get_observation_image", JSONObject().put("observation_id", candidate.optInt("id")))
+    }
+
+    private fun showObservationImage(json: String) {
+        try {
+            val obj = JSONObject(json)
+            val b64 = obj.optString("image_b64")
+            if (b64.isBlank()) {
+                findViewById<TextView>(R.id.commandResult).text = "✗ no image in response"
+                return
+            }
+            val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            if (bitmap == null) {
+                findViewById<TextView>(R.id.commandResult).text = "✗ image decode failed"
+                return
+            }
+            findViewById<ImageView>(R.id.commandImage).apply {
+                setImageBitmap(bitmap)
+                visibility = android.view.View.VISIBLE
+            }
+            findViewById<TextView>(R.id.commandResult).text =
+                "observation ${obj.optInt("observation_id")} — ${obj.optString("summary")}"
+        } catch (e: Exception) {
+            findViewById<TextView>(R.id.commandResult).text = "✗ image: ${e.message}"
+        }
+    }
+
+    private fun pretty(json: String): String = try {
+        val o = JSONObject(json)
+        "state=${o.optString("run_state")} · connected=${o.optBoolean("sensor_connected")}" +
+            (o.optJSONObject("run")?.let { " · run=\"${it.optString("name")}\"" } ?: "")
+    } catch (_: Exception) { json.take(160) }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        handleDeepLink(intent)
+    }
+
+    /** vma://pair?host=ip:port&code=CODE — from the desktop's pairing QR. */
+    private fun handleDeepLink(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme != "vma" || data.host != "pair") return
+        val host = data.getQueryParameter("host") ?: return
+        val code = data.getQueryParameter("code")
+        findViewById<android.widget.EditText>(R.id.serverUrl).setText(host)
+        if (!code.isNullOrBlank()) {
+            findViewById<android.widget.EditText>(R.id.pairingCode).setText(code)
+            toast("Scanned $host — pairing…")
+            if (!store.isPaired) pair()
+        } else {
+            toast("Scanned $host — enter the pairing code")
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshUi()
+        uiRefresher.postDelayed(object : Runnable {
+            override fun run() {
+                refreshUi()
+                uiRefresher.postDelayed(this, 1000)
+            }
+        }, 1000)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        uiRefresher.removeCallbacksAndMessages(null)
+        // Privacy/battery: the preview exists only while the screen shows it.
+        if (previewToggle.isChecked) {
+            SensorService.setLocalPreview(null)
+        }
+    }
+
+    private fun refreshUi() {
+        pairedLabel.text = when {
+            store.isPaired -> "Paired as ${store.deviceId ?: "?"} → ${store.serverUrl}"
+            else -> "Not paired"
+        }
+        renderStateChip()
+        statsText.text = StatusBus.stats
+        val active = StatusBus.status !in setOf("idle") && StatusBus.status.isNotBlank()
+        startButton.isEnabled = store.isPaired && !active
+        stopButton.isEnabled = active
+    }
+
+    /** Always-visible system state (M3 chip): OBSERVING / PAUSED /
+     *  DISCONNECTED / ERROR — never infer "watching" from raw status text. */
+    private fun renderStateChip() {
+        val raw = StatusBus.status.lowercase()
+        val (label, color) = when {
+            raw.isBlank() || raw == "idle" -> "DISCONNECTED" to 0xFF8B93A3
+            raw.startsWith("error") -> "ERROR" to 0xFFFF6B6B
+            raw.contains("no active run") || raw.startsWith("connection: closed") ||
+                raw.startsWith("connection: failed") || raw.startsWith("reconnecting") ->
+                "DISCONNECTED" to 0xFF8B93A3
+            raw == "paused" || raw.startsWith("paused") -> "PAUSED" to 0xFFFFB454
+            else -> "OBSERVING" to 0xFF3ECF8E
+        }
+        statusText.text = "$label — ${StatusBus.status.ifBlank { "no sensor" }}"
+        statusText.setTextColor(color.toInt())
+    }
+
+    private fun hasPermission(perm: String): Boolean =
+        ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED
+
+    private fun pair() {
+        val serverUrl = findViewById<android.widget.EditText>(R.id.serverUrl).text.toString()
+        val code = findViewById<android.widget.EditText>(R.id.pairingCode).text.toString()
+        if (serverUrl.isBlank() || code.isBlank()) {
+            toast("Enter the desktop URL and pairing code")
+            return
+        }
+        if (!hasPermissions()) {
+            requestPermissions()
+            return
+        }
+        store.serverUrl = serverUrl
+        toast("Pairing…")
+        Thread {
+            val result = PairingClient.pair(serverUrl, code, "${Build.MANUFACTURER} ${Build.MODEL}")
+            runOnUiThread {
+                if (result.ok && !result.token.isNullOrBlank()) {
+                    store.deviceToken = result.token
+                    store.deviceId = result.deviceId
+                    toast("Paired ✓")
+                } else {
+                    toast("Pairing failed: ${result.error}")
+                }
+                refreshUi()
+            }
+        }.start()
+    }
+
+    private fun startSensing() {
+        store.serverUrl = findViewById<android.widget.EditText>(R.id.serverUrl).text.toString()
+        if (!hasPermissions()) {
+            requestPermissions()
+            return
+        }
+        if (!store.isPaired) {
+            toast("Pair first")
+            return
+        }
+        SensorService.start(this)
+        toast("Sensor started")
+    }
+
+    private fun hasPermissions(): Boolean = REQUIRED.all {
+        ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestPermissions() {
+        ActivityCompat.requestPermissions(this, REQUIRED, REQ_CODE)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_CODE && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            toast("Permissions granted — press the button again")
+        }
+    }
+
+    private fun toast(text: String) =
+        Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+
+    companion object {
+        private const val REQ_CODE = 1
+        private val REQUIRED = buildList {
+            add(Manifest.permission.CAMERA)
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+        }.toTypedArray()
+    }
+}

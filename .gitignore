@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.tmp/
+.pytest_cache/
+*.egg-info/
+
+# private local data — never commit
+desktop/data/
+desktop/config.toml
+devices.json
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
+# android / gradle
+android/.offline-m2/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+*.keystore
+
+# editors / tooling
+.idea/
+.vscode/
+build_log.txt
+diag/
+.zcode/
+*.log

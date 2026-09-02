@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visual Memory Agent</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Visual Memory Agent</h1>
+  <div id="system-state" class="state-chip state-disconnected" title="Always-visible system state">
+    <span class="state-dot"></span><span id="system-state-label">DISCONNECTED</span>
+  </div>
+  <div id="cloud-warning" class="hidden">⚠ Cloud provider active — data leaves this machine</div>
+</header>
+
+<nav>
+  <button data-tab="dashboard" class="active">Dashboard</button>
+  <button data-tab="observations">Observations</button>
+  <button data-tab="runs">Runs</button>
+  <button data-tab="chat">Chat</button>
+  <button data-tab="models">Models</button>
+</nav>
+
+<main>
+<!-- ============================== DASHBOARD ============================== -->
+<section id="tab-dashboard" class="tab active">
+  <div class="cards">
+    <div class="card">
+      <h3>Run</h3>
+      <div id="run-state" class="big">idle</div>
+      <div id="run-name" class="muted"></div>
+      <div class="row">
+        <input id="run-name-input" placeholder="run name (e.g. trip_to_chennai)">
+        <button id="btn-start">Start run</button>
+        <button id="btn-stop" disabled>Stop</button>
+      </div>
+      <div id="run-stats" class="muted small"></div>
+    </div>
+
+    <div class="card pairing-card">
+      <h3>Connect a phone</h3>
+      <div id="phone-state" class="big">disconnected</div>
+      <div id="phone-info" class="muted small"></div>
+      <div class="pairing-note"><b>1. Put both devices on the same Wi-Fi.</b><br>
+        Do not use <code>localhost</code> on the phone.</div>
+      <div class="pairing-label">Desktop address to enter in Android</div>
+      <div id="pairing-addresses" class="pairing-addresses">finding this computer…</div>
+      <div class="row">
+        <button id="btn-copy-address" class="secondary">Copy address</button>
+      </div>
+      <div class="pairing-label">2. Enter this one-time pairing code</div>
+      <div class="pairing-code-box"><b id="pairing-code">—</b><span id="pairing-expiry" class="muted small">Generate a code to begin</span></div>
+      <div class="row">
+        <button id="btn-new-code">Generate new code</button>
+      </div>
+      <div class="pairing-label">3. Or scan this QR with the phone's camera</div>
+      <img id="pairing-qr" alt="Pairing QR" width="190" height="190">
+      <div class="pairing-note">Scanning opens the VMA app with address + code filled in and pairs automatically. The code expires in 10 minutes and works once.</div>
+      <div id="relay-info" class="muted small"></div>
+    </div>
+
+    <div class="card">
+      <h3>Pipeline</h3>
+      <div id="pipeline-stats" class="small">no active run</div>
+      <div id="last-obs" class="small"></div>
+    </div>
+
+    <div class="card">
+      <h3>Models</h3>
+      <div id="model-status" class="small">checking…</div>
+      <div class="row">
+        <button id="btn-preload-vision">Preload VLM</button>
+        <button id="btn-preload-reasoning">Preload LLM</button>
+        <button id="btn-unload-vision">Unload VLM</button>
+        <button id="btn-unload-reasoning">Unload LLM</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Image storage</h3>
+      <div id="storage-stats" class="muted small">no active run</div>
+      <div class="editor-row">
+        <label>keep images
+          <select id="cfg-save-frames">
+            <option value="none">none</option>
+            <option value="important">important only</option>
+            <option value="all">all</option>
+          </select>
+        </label>
+        <label>downscale to
+          <select id="cfg-max-side">
+            <option value="100000">original</option>
+            <option value="1920">1080p</option>
+            <option value="1280">720p</option>
+            <option value="854">480p</option>
+          </select>
+        </label>
+      </div>
+      <div class="editor-row">
+        <label>retention (min, 0=∞) <input id="cfg-retention" type="number" min="0" style="width:6em" value="0"></label>
+        <label>budget (MB, 0=∞) <input id="cfg-budget" type="number" min="0" style="width:6em" value="0"></label>
+      </div>
+      <div class="row">
+        <button id="btn-apply-storage">Apply storage policy</button>
+        <button id="btn-wipe-media" class="secondary" title="Delete retained images; observations stay">Delete stored images</button>
+      </div>
+      <div class="pairing-note">Observation text is kept regardless — deleting images does not delete potentially sensitive descriptions.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ OBSERVATIONS ============================= -->
+<section id="tab-observations" class="tab">
+  <div class="row">
+    <select id="obs-run-select"></select>
+    <label>min importance <input id="obs-min-importance" type="number" min="0" max="3" value="0" style="width:3em"></label>
+    <button id="btn-refresh-obs">Refresh</button>
+  </div>
+  <div id="observations-list" class="obs-list">no run selected</div>
+</section>
+
+<!-- ================================ RUNS ================================= -->
+<section id="tab-runs" class="tab">
+  <button id="btn-refresh-runs">Refresh</button>
+  <div id="runs-list"></div>
+</section>
+
+<!-- ================================ CHAT ================================= -->
+<section id="tab-chat" class="tab">
+  <div class="row">
+    <select id="chat-run-select"></select>
+    <button id="btn-report">Generate chronological report</button>
+  </div>
+  <div id="chat-log"></div>
+  <div id="chat-status" class="muted small"></div>
+  <form id="chat-form" class="row">
+    <button type="button" id="btn-voice" title="Hold to talk (local whisper transcription)">🎙</button>
+    <input id="chat-input" placeholder="Ask about the run… (e.g. what happened during the trip?)" autocomplete="off">
+    <button type="submit">Send</button>
+  </form>
+  <label class="muted small"><input id="voice-as-note" type="checkbox"> after recording, also save as voice note linked to nearby observations</label>
+</section>
+
+<!-- =============================== MODELS ================================ -->
+<section id="tab-models" class="tab">
+  <div class="cards">
+    <div class="card"><h3>Vision (VLM)</h3><div id="vision-model-editor"></div></div>
+    <div class="card"><h3>Reasoning (LLM)</h3><div id="reasoning-model-editor"></div></div>
+    <div class="card"><h3>Embeddings (semantic memory)</h3><div id="embeddings-editor"></div></div>
+  </div>
+  <div class="muted small">Ollama models are pulled with <code>ollama pull &lt;name&gt;</code>, then selected here. Cloud = any OpenAI-compatible endpoint (data leaves this machine).</div>
+</section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
