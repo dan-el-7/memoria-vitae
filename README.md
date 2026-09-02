@@ -51,7 +51,7 @@ WebSocket ──► bounded intake (cap 3, latest-frame-wins)
   (documented, deliberate).
 - **Voice notes** — push-to-talk on phone or dashboard; local whisper (CPU)
   transcribes; the transcript joins the memory as a linked observation.
-  Optional (off by default) continuous audio on the phone.
+  Optional (off by default) continuous audio on the phone. <small>(Currently untested)</small>
 - **Material 3 Expressive** Android app (Jetpack Compose) with bottom-nav
   menus, always-visible OBSERVING/PAUSED/DISCONNECTED/ERROR state, local-only
   camera preview, and authenticated remote commands (status / pause / resume /
@@ -131,6 +131,20 @@ cd desktop && .venv/Scripts/python -m pytest ../tests -q    # Windows
 cd desktop && .venv/bin/python -m pytest ../tests -q        # Linux/macOS
 ```
 
+## Why?
+
+- Passing this to an API would have significantly higher latency as most aren't building around latency sensitive tasks and naturally adds concern over data handling and privacy. Though support for OpenAI's API keys exists, that endpoint is untested and low priority (let me know if it's broken though)
+
+## Applications
+
+- **Personal memory** — find lost objects, recall something you briefly saw, reconstruct your day
+- **Memory assistance** — a visual diary for people with dementia or memory issues: where they were, what they did, who visited (an aid, not a medical device)
+- **Study & research** — remember notes, papers, diagrams and whiteboards that stopped existing the moment you looked away
+- **Development** — "what did the terminal show before the build broke?", IDE state, debugging history
+- **Accessibility** — recover visual context from interfaces that are hard to navigate or remember
+- **Workspace memory** — park a phone pointed at your desk or bench and track when objects appeared and disappeared
+- **AI agents** — a persistent visual history other agents can query for context instead of re-watching a video feed
+  
 ## Future
 
 - <a id="qnn"></a>Might try out stuff like pure mobile inference if the Hexagon NPU can have a decent tps when the model is converted to QNN, efficiency is also something to watch out for on handheld devices. (Would also likely need 12GB=< ram if not more, especially for the querying to have a decent model.)
