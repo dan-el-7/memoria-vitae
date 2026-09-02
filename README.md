@@ -8,8 +8,8 @@ you saw** ("where was the calculator at 3pm?", "summarize my afternoon").
 
 [^fps]:
     Currently adaptive, the capture interval automatically slows down when
-    average inference runs behind. User-chosen pace are planned.
-    
+    average inference runs behind. User-chosen rates are planned.
+
 Everything runs **local-first** (Ollama by default). No data leaves the machine
 unless you explicitly configure a cloud provider for a stage — and the UI tells
 you when you did.
@@ -35,9 +35,8 @@ WebSocket ──► bounded intake (cap 3, latest-frame-wins)
 
 - **Backpressure, never backlog** — the phone keeps at most one frame in flight;
   the desktop acks *every* frame (duplicates included) and recommends a capture
-  interval from measured VLM latency (EMA). Bounded intake with
-  latest-frame-wins, so a slow VLM yields fresh frames, not a stale queue.
-  Skips duplicate frames via a cheap check to avoid wasting power on unnecessary inference.
+  interval from measured VLM latency. A cheap change gate (64×48 MAD + dHash)
+  skips near-identical frames before any inference is spent on them.
 - **Visual memory, chronological by design** — committed observations are never
   merged or deleted for being similar; similarity only *links* and *ranks*.
   Temporal history is the product.
@@ -105,7 +104,7 @@ build online normally.
 | `tests/` | pytest suite (units, sensor-ack regressions, RAG, storage policy, auth) |
 | `tools/` | synthetic phone replay + VLM truncation/loop diagnostics |
 | `docs/` | architecture, protocol, schema, runbook, providers, privacy, limitations |
-| `AGENTS.md` | guidance + verified facts for AI coding agents working on this repo |
+| `AGENTS.md` | guidance + verified facts for AI coding agents working in this repo |
 
 ## Documentation
 
@@ -138,16 +137,16 @@ cd desktop && .venv/bin/python -m pytest ../tests -q        # Linux/macOS
 ## Applications
 
 - **Personal memory** — find lost objects, recall something you briefly saw, reconstruct your day
-- **Memory assistance** — a visual diary for people with dementia or memory issues: where they were, what they did, who visited (an aid, not a medical device)
+- **Memory assistance** — a visual diary for people with dementia or memory issues: where they were, what they did, who visited (an experimental aid, not a medical device)
 - **Study & research** — remember notes, papers, diagrams and whiteboards that stopped existing the moment you looked away
 - **Development** — "what did the terminal show before the build broke?", IDE state, debugging history
 - **Accessibility** — recover visual context from interfaces that are hard to navigate or remember
 - **Workspace memory** — park a phone pointed at your desk or bench and track when objects appeared and disappeared
 - **AI agents** — a persistent visual history other agents can query for context instead of re-watching a video feed
-  
+
 ## Future
 
-- <a id="qnn"></a>Might try out stuff like pure mobile inference if the Hexagon NPU can have a decent tps when the model is converted to QNN, efficiency is also something to watch out for on handheld devices. (Would also likely need 12GB=< ram if not more, especially for the querying to have a decent model.)
+- <a id="qnn"></a>Might try out stuff like pure mobile inference if the Hexagon NPU can have a decent tps when the model is converted to QNN, efficiency is also something to watch out for on handheld devices. (Would also likely need 12GB+ ram if not more, especially for the querying to have a decent model.)
 - Authenticated over the Internet, not just local Wi-Fi.
 - Definitely forgetting something and will get random ideas :( Memory Gacha!
 
