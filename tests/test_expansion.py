@@ -261,6 +261,10 @@ class TestImageRetrievalTool:
             parsed = json.loads(raw)
             assert parsed["ok"] is True, f"{mode} must degrade, not error"
             assert any("calculator" in (o.get("summary") or "") for o in parsed["result"])
+            # Ensure lightweight summary does not leak raw vector BLOBs or the bulky payload
+            for item in parsed["result"]:
+                assert "vec" not in item
+                assert "payload" not in item
         assert store.stats()["frames_total"] >= 1  # metric written, store usable
 
     @pytest.mark.asyncio

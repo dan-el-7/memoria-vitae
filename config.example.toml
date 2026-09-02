@@ -9,7 +9,7 @@ model = "qwen3-vl:2b"
 repeat_penalty = 1.3               # tames the 2B model's loop mode on screen-dense frames
 num_ctx = 8192                     # headroom for bounded grammar output + visual tokens
 keep_alive = -1                    # numeric: pin the VLM (string "-1" is rejected)
-enable_thinking = false            # with thinking on, `format` is NOT applied (see AGENTS.md)
+# repeat_penalty = 1.2             # prevents thinking/repetition loops on reasoningenable_thinking = false            # with thinking on, `format` is NOT applied (see AGENTS.md)
 temperature = 0.2
 
 [reasoning]
@@ -20,7 +20,7 @@ keep_alive = "10m"
 # num_gpu = 20                     # Ollama GPU layers; on 8 GB cards use hybrid placement
 #                                  # (≈20) so the pinned VLM + reasoning LLM coexist.
 #                                  # Full-GPU placement EVICTS the VLM (verified).
-enable_thinking = false
+# repeat_penalty = 1.2             # prevents thinking/repetition loops on reasoningenable_thinking = false
 temperature = 0.2
 
 [pipeline]

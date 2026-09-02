@@ -286,11 +286,19 @@ class RunStore:
         extension or extra service is required. Attach observation rows for
         ids above the score threshold order.
         """
+        where = ["o.importance >= ?"]
+        params: list[Any] = [importance_min]
+        if start:
+            where.append("o.ts >= ?")
+            params.append(start)
+        if end:
+            where.append("o.ts <= ?")
+            params.append(end)
         rows = self._conn.execute(
-            """SELECT o.*, v.vec FROM observation_vec v
+            f"""SELECT o.*, v.vec FROM observation_vec v
                JOIN observations o ON o.id = v.obs_id
-               WHERE o.importance >= ?""",
-            (importance_min,),
+               WHERE {" AND ".join(where)}""",
+            params,
         ).fetchall()
         q = [float(x) for x in query_vec]
         qnorm = math.sqrt(sum(x * x for x in q)) or 1.0
@@ -309,8 +317,6 @@ class RunStore:
         for score, row in scored[:limit]:
             obs = _obs(row)
             if obs is None:
-                continue
-            if (start and obs["ts"] < start) or (end and obs["ts"] > end):
                 continue
             obs["similarity"] = round(score, 4)
             out.append(obs)
@@ -494,6 +500,7 @@ def _obs(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     out = dict(row)
+    out.pop("vec", None)
     try:
         out["payload"] = json.loads(out["payload"])
     except (json.JSONDecodeError, TypeError):

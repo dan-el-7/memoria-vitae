@@ -52,3 +52,18 @@ async def test_ollama_inspect_falls_back_to_thinking_field() -> None:
         await provider.aclose()
 
     assert answer == "the answer text"
+
+
+def test_ollama_chat_message_encodes_images_to_b64() -> None:
+    """ChatMessage images (raw bytes) must be b64-encoded strings for Ollama /api/chat JSON."""
+    import json
+    from vma.providers.base import ChatMessage
+    from vma.providers.ollama_provider import _chat_message_to_ollama
+
+    msg = ChatMessage(role="user", content="look at this", images=[b"\xff\xd8\xff\xe0test_jpeg"])
+    payload = _chat_message_to_ollama(msg)
+    assert isinstance(payload["images"][0], str)
+    # Must be JSON-serializable without TypeError
+    serialized = json.dumps(payload)
+    assert "test_jpeg" not in serialized  # encoded in base64
+

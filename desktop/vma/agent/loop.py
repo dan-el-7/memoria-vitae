@@ -110,7 +110,9 @@ async def run_chat(
 
     for _ in range(MAX_TOOL_ITERATIONS):
         iterations += 1
-        result: ChatResult = await reasoning.chat(messages, tools=ALL_TOOLS)
+        if on_status:
+            await on_status(f"thinking (step {iterations})...")
+        result: ChatResult = await reasoning.chat(messages, tools=ALL_TOOLS, on_stream=on_delta)
         if not result.tool_calls:
             run.store.add_chat_message(
                 "assistant", result.content,
@@ -154,11 +156,13 @@ async def run_chat(
                 ))
 
     # Iteration budget exhausted: ask for a direct answer with what we have.
+    if on_status:
+        await on_status("synthesizing answer...")
     messages.append(ChatMessage(
         role="user",
         content="Tool budget reached. Answer now using the information gathered so far.",
     ))
-    result = await reasoning.chat(messages, tools=None)
+    result = await reasoning.chat(messages, tools=None, on_stream=on_delta)
     run.store.add_chat_message(
         "assistant", result.content, tool_trace={"calls": tool_trace, "budget_exhausted": True},
         provider="reasoning", model=getattr(reasoning, "model", None),

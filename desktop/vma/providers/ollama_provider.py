@@ -355,7 +355,10 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
 def _chat_message_to_ollama(m: ChatMessage) -> dict[str, Any]:
     out: dict[str, Any] = {"role": m.role, "content": m.content}
     if m.images:
-        out["images"] = m.images
+        out["images"] = [
+            _b64(img) if isinstance(img, (bytes, bytearray)) else str(img)
+            for img in m.images
+        ]
     if m.tool_calls:
         out["tool_calls"] = [
             {"function": {"name": c.name, "arguments": c.arguments}} for c in m.tool_calls

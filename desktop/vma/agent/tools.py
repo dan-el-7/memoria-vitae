@@ -193,18 +193,46 @@ async def execute_tool(ctx: ToolContext, name: str, args: dict[str, Any]) -> str
         return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
+def _clean_obs_summary(obs: dict[str, Any]) -> dict[str, Any]:
+    """Lightweight observation summary for LLM context.
+
+    Excludes the heavy nested perception `payload` (thousands of characters of
+    duplicate fields and screen text) and internal vector BLOBs. Full payload
+    remains accessible through `get_observation(id)`.
+    """
+    clean: dict[str, Any] = {
+        "id": obs["id"],
+        "ts": obs["ts"],
+        "local_ts": obs.get("local_ts"),
+        "kind": obs.get("kind"),
+        "importance": obs.get("importance"),
+        "scene": obs.get("scene"),
+        "summary": obs.get("summary"),
+    }
+    if obs.get("importance_reason"):
+        clean["importance_reason"] = obs["importance_reason"]
+    if "similarity" in obs:
+        clean["similarity"] = obs["similarity"]
+    if obs.get("kind") == "voice" and isinstance(obs.get("payload"), dict):
+        clean["transcript"] = obs["payload"].get("transcript") or obs.get("summary")
+    return clean
+
+
 async def _execute(ctx: ToolContext, name: str, args: dict[str, Any]) -> Any:
     store = ctx.run.store
     if name == "search_observations":
-        return await _search_observations(ctx, args)
+        results = await _search_observations(ctx, args)
+        return [_clean_obs_summary(r) for r in results]
     if name == "get_observations_in_time_range":
-        return store.observations_in_range(
+        results = store.observations_in_range(
             str(args["start"]), str(args["end"]), limit=int(args.get("limit") or 200)
         )
+        return [_clean_obs_summary(r) for r in results]
     if name == "get_observation":
         obs = store.get_observation(int(args["observation_id"]))
         if obs is None:
             raise FileNotFoundError(f"observation {args['observation_id']}")
+        obs.pop("vec", None)
         return obs
     if name == "get_observation_image":
         return await _get_observation_image(ctx, args)
