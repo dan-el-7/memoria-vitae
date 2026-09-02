@@ -1,7 +1,7 @@
 # Memoria Vitae
 
 Turn an old Android phone into a **private, continuous visual memory**. The phone
-streams ~1 fps camera frames to your desktop over WebSocket; a small local vision
+streams ~1 <small><sub>(planned to be user chosen eventually, currently it is adaptive and slows down capture times if avg inference is running behind)</small></sub> fps camera frames to your desktop over WebSocket; a small local vision
 model (VLM) converts each frame into structured observations; everything is stored
 in a per-run SQLite database; and a local reasoning LLM lets you **chat with what
 you saw** ("where was the calculator at 3pm?", "summarize my afternoon").
@@ -56,7 +56,7 @@ WebSocket ──► bounded intake (cap 3, latest-frame-wins)
 
 ## Quickstart
 
-Requirements: Python 3.12+, [Ollama](https://ollama.com), Android Studio (for the app).
+Requirements: Python 3.12+, [Ollama](https://ollama.com), Android Studio (for the app). (debug builds in releases, may not always be up-to-date though.)
 
 ```bash
 ollama pull qwen3-vl:2b
@@ -71,7 +71,7 @@ cd ..
 # dashboard: http://127.0.0.1:8619
 ```
 
-Pair the phone: generate a code (or scan the dashboard QR) → the Android app
+Pair the phone: generate a code (or scan the dashboard QR) (might need to add the http:// on the dashboard at the start, Android intent limitations maybe, will see) → the Android app
 deep-links, pairs, and starts streaming. Voice notes need
 `pip install faster-whisper` and `[stt] enabled = true` in `config.toml`
 (see `docs/RUNBOOK.md`).
@@ -124,6 +124,14 @@ consented — read `docs/PRIVACY.md` before running this in public spaces.
 cd desktop && .venv/Scripts/python -m pytest ../tests -q    # Windows
 cd desktop && .venv/bin/python -m pytest ../tests -q        # Linux/macOS
 ```
+
+## Future
+
+- Might try out stuff like pure mobile inference if the Hexagon NPU can have a decent tps when the model is converted to QNN, efficiency is also something to watch out for on handheld devices. (Would also likely need 12GB=< ram if not more, especially for the querying to have a decent model.)
+- Authenticated over the Internet, not just local Wi-Fi.
+
+## Similar Work
+Found this after doing much of the work on this random idea I had, pretty similar and has useful insights: https://arxiv.org/html/2607.11487v1
 
 ## License
 
