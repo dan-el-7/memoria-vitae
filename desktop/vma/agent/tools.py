@@ -60,6 +60,21 @@ GET_OBSERVATION = ToolSpec(
         "required": ["observation_id"],
     },
 )
+GET_TIMELINE_INDEX = ToolSpec(
+    name="get_timeline_index",
+    description="FAST PATH for broad questions spanning many hours ('summarize my afternoon', "
+                "'what happened today'): returns pre-built compact timeline digests, one per "
+                "hour, instead of scanning thousands of raw rows. Use it FIRST for long spans; "
+                "for hours it does not cover, fall back to search_observations / "
+                "get_observations_in_time_range for that specific window.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "start": {"type": "string", "description": "Optional ISO timestamp lower bound"},
+            "end": {"type": "string", "description": "Optional ISO timestamp upper bound"},
+        },
+    },
+)
 GET_OBSERVATION_IMAGE = ToolSpec(
     name="get_observation_image",
     description="Explicitly retrieve the retained camera image for one observation. The image is "
@@ -157,8 +172,8 @@ WRITE_FILE = ToolSpec(
 )
 
 ALL_TOOLS = [SEARCH_OBSERVATIONS, GET_OBSERVATIONS_IN_RANGE, GET_OBSERVATION,
-             GET_OBSERVATION_IMAGE, GET_LOCATION_HISTORY, GET_RUN_STATS, APPEND_NOTE,
-             CREATE_REPORT, INSPECT_FRAME, READ_FILE, LIST_FILES, WRITE_FILE]
+             GET_TIMELINE_INDEX, GET_OBSERVATION_IMAGE, GET_LOCATION_HISTORY, GET_RUN_STATS,
+             APPEND_NOTE, CREATE_REPORT, INSPECT_FRAME, READ_FILE, LIST_FILES, WRITE_FILE]
 
 
 @dataclass
@@ -234,6 +249,13 @@ async def _execute(ctx: ToolContext, name: str, args: dict[str, Any]) -> Any:
             raise FileNotFoundError(f"observation {args['observation_id']}")
         obs.pop("vec", None)
         return obs
+    if name == "get_timeline_index":
+        hours = store.hours_in_range(args.get("start"), args.get("end"))
+        if not hours:
+            return {"indexed_hours": 0,
+                    "note": "no hourly index available for this range; "
+                            "use search_observations / get_observations_in_time_range"}
+        return {"indexed_hours": len(hours), "hours": hours}
     if name == "get_observation_image":
         return await _get_observation_image(ctx, args)
     if name == "get_location_history":

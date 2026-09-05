@@ -463,13 +463,73 @@ class RunStore:
             "reports": one("SELECT COUNT(*) FROM reports"),
         }
 
+    # ------------------------------------------------- hour index (HTI)
+
+    def unindexed_closed_hours(self, before_hour: str, limit: int = 2) -> list[tuple[str, int]]:
+        """Oldest closed UTC hours with observations but no hour_index row yet.
+
+        `before_hour` is the current hour prefix ('YYYY-MM-DDTHH') — the open
+        hour is never indexed so a summary can't miss later observations.
+        """
+        rows = self._conn.execute(
+            """SELECT substr(o.ts, 1, 13) AS h, COUNT(*) AS n
+               FROM observations o
+               WHERE substr(o.ts, 1, 13) != ?
+               GROUP BY h
+               HAVING h NOT IN (SELECT substr(hour_start, 1, 13) FROM hour_index)
+               ORDER BY h
+               LIMIT ?""",
+            (before_hour, limit),
+        ).fetchall()
+        return [(r["h"], r["n"]) for r in rows]
+
+    def observations_for_hour(self, hour_prefix: str, limit: int = 240) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT ts, kind, importance, scene, summary FROM observations
+               WHERE substr(ts, 1, 13) = ? ORDER BY ts LIMIT ?""",
+            (hour_prefix, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_hour_index(self, *, hour_start: str, summary: str, model: str | None,
+                       provider: str | None, n_obs: int) -> None:
+        self._conn.execute(
+            """INSERT INTO hour_index (hour_start, summary, model, provider, n_obs, created_ts)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(hour_start) DO UPDATE SET summary=excluded.summary,
+                   model=excluded.model, provider=excluded.provider,
+                   n_obs=excluded.n_obs, created_ts=excluded.created_ts""",
+            (hour_start, summary[:4000], model, provider, n_obs, iso()),
+        )
+        self._conn.commit()
+
+    def hours_in_range(self, start: str | None = None, end: str | None = None,
+                       limit: int = 200) -> list[dict[str, Any]]:
+        sql = "SELECT hour_start, summary, n_obs, model, created_ts FROM hour_index"
+        conds, args = [], []
+        if start:
+            conds.append("hour_start >= ?")
+            args.append(start)
+        if end:
+            conds.append("hour_start <= ?")
+            args.append(end)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY hour_start LIMIT ?"
+        args.append(limit)
+        rows = self._conn.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def hour_index_count(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM hour_index").fetchone()[0])
+
     # ------------------------------------------------------------- delete
 
     def delete_all(self) -> None:
         """Wipe run contents (used when a run is deleted)."""
         for table in ("observation_fts", "observation_vec", "observations", "media", "frames",
                       "location_samples", "notes", "chat_messages", "metrics", "device_events",
-                      "reports"):
+                      "reports", "hour_index"):
             if table == "observation_fts":
                 try:
                     self._conn.execute("DELETE FROM observation_fts")

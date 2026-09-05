@@ -36,3 +36,17 @@ percentiles), `embeddings` (vectorized observations), and `media_files` /
 | `media_jpeg_quality` | storage JPEG quality |
 | `media_retention_minutes` | files older than this are deleted (0 = forever); DB rows are cleared, observations stay |
 | `media_budget_bytes` | hard cap on retained-image bytes (0 = unlimited); eviction is oldest-first and protects importance ≥ 2 while anything else remains |
+
+## Hour index (`hour_index`, optional HTI fast path)
+
+One compact LLM timeline per CLOSED UTC hour, built by an idle-time worker pass
+when `[pipeline] hourly_index = true` (off by default; web dashboard: *Memory
+indexing* card). Columns: `hour_start` (unique ISO UTC hour), `summary`
+(chronological bullets), `model`, `provider`, `n_obs`, `created_ts`.
+
+Rules: additive only (raw observation rows are never merged, deleted, or
+rewritten); the currently open hour is never indexed; the pass is skipped
+entirely when the reasoning stage is a cloud provider (egress guard, metric
+`hour_index_skipped_cloud`); reindexing an hour REPLACES its digest
+(`ON CONFLICT ... DO UPDATE`). The agent reaches it via the
+`get_timeline_index` tool.

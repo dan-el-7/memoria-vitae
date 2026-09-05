@@ -92,6 +92,7 @@ class PipelineWorker:
         *,
         device_id: str = "unknown",
         embedder: Any | None = None,
+        indexer: Any | None = None,  # HourlyIndexer (HTI fast path), optional
     ) -> None:
         self.vision = vision
         self.store = store
@@ -99,6 +100,7 @@ class PipelineWorker:
         self.run_dir = run_dir
         self.device_id = device_id
         self.embedder = embedder
+        self.indexer = indexer
         self.intake = FrameIntake(capacity=pipeline_cfg.intake_queue_capacity)
         self.detector = ChangeDetector(
             mad_threshold=pipeline_cfg.change_mad_threshold,
@@ -113,6 +115,8 @@ class PipelineWorker:
         self._media_dir = run_dir / "media"
         self._embed_failures = 0  # circuit breaker: 3 strikes disables embeddings
         self._last_media_sweep_mono = 0.0
+        self._last_index_sweep_mono = 0.0
+        self._index_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -130,6 +134,9 @@ class PipelineWorker:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
             self._task = None
+        if self._index_task is not None and not self._index_task.done():
+            self._index_task.cancel()
+        self._index_task = None
         self.status.running = False
 
     # --------------------------------------------------------------- input
@@ -166,6 +173,7 @@ class PipelineWorker:
                 frame = await asyncio.wait_for(self.intake.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 self._periodic_media_sweep()
+                self._periodic_index_sweep()
                 await self._maybe_heartbeat()
                 continue
             except asyncio.CancelledError:
@@ -349,6 +357,29 @@ class PipelineWorker:
                     (self.run_dir / path).unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    def _periodic_index_sweep(self) -> None:
+        """HTI: index closed hours while the pipeline is idle.
+
+        Runs only when the intake queue is empty (this method is reached via
+        the 1s intake timeout), so the LLM pass never competes with frame
+        perception. Fire-and-forget task: generation can take tens of seconds.
+        """
+        if self.indexer is None or not getattr(self.indexer, "enabled", False):
+            return
+        now = time.monotonic()
+        if now - self._last_index_sweep_mono < 60.0:
+            return
+        self._last_index_sweep_mono = now
+        if self._index_task is not None and not self._index_task.done():
+            return
+        self._index_task = asyncio.create_task(self._index_run(), name="hour-index")
+
+    async def _index_run(self) -> None:
+        try:
+            await self.indexer.build_missing()
+        except Exception as exc:  # indexing is an enhancement; never kill the worker
+            self.store.add_metric("hour_index_error", 1, {"error": str(exc)[:300]})
 
     def _update_recommended_interval(self) -> None:
         vlm_ms = self.status.vlm_latency_ms_ema or 1000.0

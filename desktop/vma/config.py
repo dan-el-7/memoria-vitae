@@ -64,6 +64,11 @@ class PipelineConfig:
     # Voice notes link to observations within this many minutes (temporal
     # neighbors); semantic neighbors are added via the embedding below.
     voice_note_context_minutes: int = 2
+    # Hierarchical Temporal Indexing: when idle, compress each closed hour of
+    # raw observations into one compact LLM timeline (hour_index table) as a
+    # fast path for broad agent queries. Adds an index only — rows are never
+    # merged/deleted. Skipped automatically if the reasoning stage is cloud.
+    hourly_index: bool = False
 
 
 @dataclass

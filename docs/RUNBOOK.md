@@ -99,7 +99,7 @@ Build it with Android Studio JBR 21 and the cached Gradle 9.4.1 distribution:
 ```bat
 set JAVA_HOME=<Android Studio>\jbr
 cd android
-gradle.bat  :: Gradle 9.4.1 (wrapper or local distribution) assembleDebug
+gradle.bat assembleDebug
 ```
 
 Install with Android Studio or `adb install -r` from a machine with an attached
@@ -140,3 +140,17 @@ flow. Do not treat the opaque channel id as a secret.
 - A phone with no active run should receive `welcome` with `run_id: null`.
 - A frame is not evidence of an observation until its ack and the run stats show
   it was accepted or classified as no-change.
+
+## Hierarchical Temporal Indexing (HTI)
+
+Toggle: `[pipeline] hourly_index = true` in `config.toml`, or the *Memory
+indexing* card on the dashboard. When enabled, the pipeline worker compresses
+each finished hour of observations into a short LLM timeline (`hour_index`
+table) while the intake queue is idle — indexing never competes with live
+perception. Broad agent questions ("summarize my afternoon") hit the
+`get_timeline_index` fast path first; drill-down stays on the row tools.
+
+Notes: local reasoning models only (cloud reasoning stages are skipped — the
+digest would ship observation text off-machine); backfill is progressive,
+oldest hours first; the open hour is indexed only after it closes; raw
+observations are never altered.

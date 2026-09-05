@@ -20,6 +20,7 @@ from .agent.loop import run_chat
 from .agent.tools import ToolContext
 from .config import AppConfig, EmbeddingConfig, ProviderConfig, SttConfig, load_config
 from .pipeline.worker import PipelineWorker
+from .pipeline.hourly import HourlyIndexer
 from .providers.base import ProviderError
 from .providers.factory import make_embedder, make_provider
 from .providers.ollama_provider import OllamaProvider
@@ -73,14 +74,20 @@ class AppState:
         allowed = {"kind", "model", "base_url", "api_key", "num_ctx", "keep_alive", "num_gpu",
                    "enable_thinking", "temperature", "repeat_penalty"}
         for key, value in data.items():
-            if key in allowed and value is not None:
-                if key == "num_ctx":
-                    value = int(value)
-                elif key == "num_gpu":
-                    value = int(value) if str(value).strip() else None
-                elif key == "keep_alive" and isinstance(value, str):
-                    value = int(value.strip()) if value.strip() in {"-1", "0"} else value.strip()
-                setattr(target, key, value)
+            if key not in allowed:
+                continue
+            if value is None and key != "num_gpu":
+                continue
+            if key == "num_ctx":
+                value = int(value)
+            elif key == "num_gpu":
+                # num_gpu accepts an explicit reset: null/""/"auto" -> None,
+                # i.e. Ollama places layers automatically. Without this there is
+                # no path back to auto once a layer count has been saved.
+                value = int(value) if value is not None and str(value).strip() not in ("", "auto") else None
+            elif key == "keep_alive" and isinstance(value, str):
+                value = int(value.strip()) if value.strip() in {"-1", "0"} else value.strip()
+            setattr(target, key, value)
         old = getattr(self, stage)
         self._make_providers()
         if old is not None:
@@ -88,6 +95,12 @@ class AppState:
         # A running pipeline picks up the new vision provider immediately.
         if self.worker is not None and stage == "vision":
             self.worker.vision = self.vision
+        # HTI follows the reasoning stage (model/kind changed → rebuild).
+        if self.worker is not None and stage == "reasoning":
+            self.worker.indexer = HourlyIndexer(
+                self.reasoning, self.cfg.reasoning.kind, self.worker.store,
+                enabled=self.cfg.pipeline.hourly_index,
+            )
         save_config_toml(self.cfg)
 
     def apply_embeddings_config(self, data: dict[str, Any]) -> None:
@@ -157,6 +170,13 @@ class AppState:
                 "reasoning": _cfg_dict(self.cfg.reasoning),
                 "ollama_url": self.cfg.ollama_url,
             },
+            "pipeline_config": {
+                "save_frames": self.cfg.pipeline.save_frames,
+                "media_max_side": self.cfg.pipeline.media_max_side,
+                "media_retention_minutes": self.cfg.pipeline.media_retention_minutes,
+                "media_budget_bytes": self.cfg.pipeline.media_budget_bytes,
+                "hourly_index": self.cfg.pipeline.hourly_index,
+            },
         }
 
     # ---------------------------------------------------------- ui events
@@ -205,7 +225,7 @@ def save_config_toml(cfg: AppConfig) -> None:
         ]
         return "\n".join(lines)
 
-    content = f"""# Memoria Vitae configuration (auto-saved)
+    content = f"""# Visual Memory Agent configuration (auto-saved)
 ollama_url = "{cfg.ollama_url}"
 
 [vision]
@@ -226,6 +246,7 @@ media_jpeg_quality = {cfg.pipeline.media_jpeg_quality}
 media_retention_minutes = {cfg.pipeline.media_retention_minutes}
 media_budget_bytes = {cfg.pipeline.media_budget_bytes}
 voice_note_context_minutes = {cfg.pipeline.voice_note_context_minutes}
+hourly_index = {str(cfg.pipeline.hourly_index).lower()}
 
 [embeddings]
 enabled = {str(cfg.embeddings.enabled).lower()}
@@ -303,7 +324,7 @@ async def lifespan(app: FastAPI):
         state.current_run.close()
 
 
-app = FastAPI(title="Memoria Vitae", lifespan=lifespan)
+app = FastAPI(title="Visual Memory Agent", lifespan=lifespan)
 
 
 # ------------------------------------------------------------- basic routes
@@ -406,6 +427,10 @@ async def create_run(body: dict[str, Any]) -> dict[str, Any]:
         st.vision, run.store, st.cfg.pipeline, run.dir,
         device_id=str((device or {}).get("device_id", "unknown")),
         embedder=st.embedder,
+        indexer=HourlyIndexer(
+            st.reasoning, st.cfg.reasoning.kind, run.store,
+            enabled=st.cfg.pipeline.hourly_index,
+        ),
     )
     st.worker.start()
     await st.broadcast_ui()
@@ -625,6 +650,7 @@ async def set_pipeline_config(body: dict[str, Any]) -> dict[str, Any]:
         "media_jpeg_quality": int,
         "media_retention_minutes": int,
         "media_budget_bytes": int,
+        "hourly_index": bool,
     }
     applied: dict[str, Any] = {}
     for key, cast in allowed.items():
@@ -642,6 +668,8 @@ async def set_pipeline_config(body: dict[str, Any]) -> dict[str, Any]:
             applied[key] = value
     if st.worker is not None:
         st.worker.cfg = st.cfg.pipeline
+        if st.worker.indexer is not None and "hourly_index" in applied:
+            st.worker.indexer.enabled = applied["hourly_index"]
     save_config_toml(st.cfg)
     return {"ok": True, "applied": applied}
 

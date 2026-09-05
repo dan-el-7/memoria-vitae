@@ -1,4 +1,4 @@
-/* Memoria Vitae dashboard — vanilla JS, no build step. */
+/* Visual Memory Agent dashboard — vanilla JS, no build step. */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -189,6 +189,7 @@ $("#btn-apply-storage").addEventListener("click", async () => {
     media_max_side: Number($("#cfg-max-side").value || 1024),
     media_retention_minutes: Number($("#cfg-retention").value || 0),
     media_budget_bytes: Math.round(budgetMb * 1e6),
+    hourly_index: $("#cfg-hourly-index").checked,
   };
   const response = await fetch("/api/config/pipeline", { method: "POST",
     headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -429,6 +430,16 @@ async function renderModelEditors() {
   try { models = await (await fetch("/api/ollama/models")).json(); } catch {}
   const st = await (await fetch("/api/status")).json();
   const cfg = st.config || {};
+  const pc = st.pipeline_config || {};
+  const setSelect = (id, v) => {
+    const el = $(id);
+    if (el && [...el.options].some((o) => o.value === String(v))) el.value = String(v);
+  };
+  setSelect("#cfg-save-frames", pc.save_frames || "important");
+  setSelect("#cfg-max-side", pc.media_max_side || 1024);
+  if ($("#cfg-retention")) $("#cfg-retention").value = pc.media_retention_minutes ?? 0;
+  if ($("#cfg-budget")) $("#cfg-budget").value = pc.media_budget_bytes ? Math.round(pc.media_budget_bytes / 1e6) : 0;
+  if ($("#cfg-hourly-index")) $("#cfg-hourly-index").checked = !!pc.hourly_index;
   for (const stage of ["vision", "reasoning"]) {
     const c = cfg[stage] || {};
     const box = $(`#${stage}-model-editor`);
@@ -450,15 +461,23 @@ async function renderModelEditors() {
       <div class="editor-row">
         <label>ctx <input id="${stage}-ctx" type="number" style="width:6em" value="${c.num_ctx || 4096}"></label>
         <label>keep_alive <input id="${stage}-keep" style="width:6em" value="${c.keep_alive || "10m"}"></label>
-        <label>gpu layers <input id="${stage}-gpu" type="number" style="width:5em" placeholder="auto" value="${c.num_gpu ?? ""}"></label>
+        <label>gpu layers <input id="${stage}-gpu" type="number" style="width:5em" placeholder="auto" title="empty = auto (Ollama places layers)" value="${c.num_gpu ?? ""}"></label>
+        <button type="button" id="${stage}-gpu-reset" class="ghost" title="reset gpu layers to auto">↺</button>
         <label><input id="${stage}-think" type="checkbox" ${c.enable_thinking ? "checked" : ""}> thinking</label>
         <button data-stage="${stage}">Apply</button>
       </div>`;
     box.querySelector(`#${stage}-kind`).addEventListener("change", (ev) => {
       box.querySelector(`#${stage}-cloud`).style.display = ev.target.value === "ollama" ? "none" : "";
     });
-    box.querySelector("button").addEventListener("click", async () => {
+    const applyBtn = box.querySelector("button[data-stage]");
+    box.querySelector(`#${stage}-gpu-reset`).addEventListener("click", () => {
+      box.querySelector(`#${stage}-gpu`).value = "";
+      applyBtn.click();
+    });
+    applyBtn.addEventListener("click", async () => {
       const kind = box.querySelector(`#${stage}-kind`).value;
+      const gpuRaw = box.querySelector(`#${stage}-gpu`).value.trim();
+      const gpuNum = Number(gpuRaw);
       const body = {
         kind,
         model: box.querySelector(`#${stage}-model`).value,
@@ -467,8 +486,8 @@ async function renderModelEditors() {
       };
       if (kind === "ollama") {
         body.keep_alive = box.querySelector(`#${stage}-keep`).value.trim();
-        const gpu = box.querySelector(`#${stage}-gpu`).value.trim();
-        if (gpu) body.num_gpu = Number(gpu);
+        // empty/invalid = auto: send explicit null so the backend clears the saved value
+        body.num_gpu = gpuRaw && Number.isFinite(gpuNum) ? gpuNum : null;
       }
       else {
         body.base_url = box.querySelector(`#${stage}-base-url`).value.trim();

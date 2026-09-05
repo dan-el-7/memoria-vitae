@@ -15,12 +15,14 @@ import android.os.Looper
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Preview
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -115,6 +117,9 @@ class MainActivity : androidx.activity.ComponentActivity() {
     private val previewOn = mutableStateOf(false)
     private val recording = mutableStateOf(false)
     private val continuousAudio = mutableStateOf(false)
+    private val keepAwake = mutableStateOf(false)
+    private val keepAwakePowerSave = mutableStateOf(true)
+    private val screenBlacked = mutableStateOf(false)
     private val menuOpen = mutableStateOf(false)
     private val confirmUnpair = mutableStateOf(false)
 
@@ -154,6 +159,8 @@ class MainActivity : androidx.activity.ComponentActivity() {
         super.onCreate(savedInstanceState)
         store = DeviceStore(this)
         serverUrlText.value = store.serverUrl
+        keepAwake.value = store.keepAwake
+        keepAwakePowerSave.value = store.keepAwakePowerSave
         pendingDeepLink = intent
         setContent { VmaTheme { VmaApp() } }
     }
@@ -410,7 +417,24 @@ class MainActivity : androidx.activity.ComponentActivity() {
     @Composable
     private fun VmaApp() {
         val chip = stateChip(statusRaw.value)
-        Scaffold(
+        // Keep Awake: hold the screen on via window flag; power saving blacks
+        // the screen (overlay + brightness floor) while streaming continues.
+        DisposableEffect(keepAwake.value, keepAwakePowerSave.value, screenBlacked.value) {
+            val win = window
+            if (keepAwake.value) win.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            else win.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            win.attributes = win.attributes.apply {
+                screenBrightness =
+                    if (keepAwake.value && keepAwakePowerSave.value && screenBlacked.value) {
+                        WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_OFF
+                    } else {
+                        WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                    }
+            }
+            onDispose { }
+        }
+        Box(Modifier.fillMaxSize()) {
+            Scaffold(
             topBar = {
                 CenterAlignedTopAppBar(
                     title = { Text("VMA Sensor", fontWeight = FontWeight.SemiBold) },
@@ -452,6 +476,23 @@ class MainActivity : androidx.activity.ComponentActivity() {
                     0 -> SensorTab()
                     1 -> MemoryTab()
                     else -> ConnectTab()
+                }
+            }
+        }
+            // Power-saving black screen: hides everything, tap anywhere to peek.
+            if (keepAwake.value && keepAwakePowerSave.value && screenBlacked.value) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.Black)
+                        .clickable { screenBlacked.value = false },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "◉ sensing — screen dimmed · tap to peek",
+                        color = Color.White.copy(alpha = 0.25f),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
             }
         }
@@ -580,6 +621,66 @@ class MainActivity : androidx.activity.ComponentActivity() {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+
+            // Keep Awake: hold the screen on while the app is open. With the
+            // power-saving option, the screen blacks out (tap to peek) so an
+            // OLED panel draws almost nothing while streaming continues.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Button(
+                    onClick = {
+                        when {
+                            !keepAwake.value -> {
+                                keepAwake.value = true
+                                store.keepAwake = true
+                                if (keepAwakePowerSave.value) screenBlacked.value = true
+                                message.value = "Keep awake on"
+                            }
+                            keepAwakePowerSave.value && !screenBlacked.value ->
+                                screenBlacked.value = true
+                            else -> {
+                                keepAwake.value = false
+                                store.keepAwake = false
+                                screenBlacked.value = false
+                                message.value = "Keep awake off"
+                            }
+                        }
+                    },
+                ) {
+                    Text(
+                        when {
+                            !keepAwake.value -> "Keep awake"
+                            keepAwakePowerSave.value && !screenBlacked.value -> "Dim screen"
+                            else -> "Keep awake: ON"
+                        }
+                    )
+                }
+            }
+            if (keepAwake.value) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(
+                        checked = keepAwakePowerSave.value,
+                        onCheckedChange = {
+                            keepAwakePowerSave.value = it
+                            store.keepAwakePowerSave = it
+                            if (it) screenBlacked.value = true else screenBlacked.value = false
+                        },
+                    )
+                    Text(
+                        "Black screen while awake (power saving)",
+                        modifier = Modifier.padding(start = 10.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                Text(
+                    "Screen blacks out and brightness drops to zero; tap anywhere to peek. " +
+                        "Streaming continues either way — off keeps the preview visible instead.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(

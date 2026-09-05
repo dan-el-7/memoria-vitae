@@ -88,6 +88,8 @@ button:hover:not(:disabled) { filter: brightness(1.12); }
 button:active:not(:disabled) { transform: scale(.97); }
 button:disabled { opacity: .4; cursor: default; }
 button.secondary { background: var(--border); color: var(--text); }
+button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); padding: 4px 9px; }
+button.ghost:hover { color: var(--text); }
 input, select {
   background: var(--bg); color: var(--text); border: 1px solid var(--border);
   padding: 9px 14px; border-radius: 14px; font-size: 13px;

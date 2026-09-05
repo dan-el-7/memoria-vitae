@@ -130,3 +130,17 @@ CREATE TABLE IF NOT EXISTS observation_vec (
     model   TEXT NOT NULL,
     vec     BLOB NOT NULL
 );
+
+-- Hierarchical temporal index: one compact LLM timeline per closed hour.
+-- Fast path for broad agent queries: read N digests instead of scanning
+-- thousands of raw observation rows. Built lazily by the worker when the
+-- pipeline toggle is on; raw rows are never deleted or merged (memory pillar).
+CREATE TABLE IF NOT EXISTS hour_index (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    hour_start  TEXT NOT NULL UNIQUE,                 -- ISO-8601 UTC hour: 2026-09-06T13:00:00Z
+    summary     TEXT NOT NULL,                        -- compact chronological bullets
+    model       TEXT,
+    provider    TEXT,
+    n_obs       INTEGER NOT NULL DEFAULT 0,
+    created_ts  TEXT NOT NULL
+);

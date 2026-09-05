@@ -1,4 +1,4 @@
-# AGENTS.md — Memoria Vitae (internal short name: vma)
+# AGENTS.md — Visual Memory & Analysis Agent (VMA)
 
 Guidance for AI coding agents working in this repo. Read this first; deeper detail
 lives in `docs/` (see the map at the bottom).
@@ -68,7 +68,7 @@ desktop\.venv\Scripts\python tools\synthetic_phone.py --folder <imgs> --code <PA
 :: Android APK (offline build; needs JAVA_HOME set to Android Studio's JBR)
 set "JAVA_HOME=<Android Studio>\jbr"
 cd android
-gradle.bat  :: Gradle 9.4.1 (wrapper or local distribution) assembleDebug --offline
+gradle.bat assembleDebug --offline
 :: output: android\app\build\outputs\apk\debug\app-debug.apk
 ```
 
@@ -187,3 +187,14 @@ VLM schema caps + loop mode (verified 2026-09-02, qwen3-vl:2b / Ollama 0.33.x):
 - Run tests before declaring a desktop-side change done.
 - The desktop listens on 127.0.0.1:8619 by default; LAN pairing uses the
   machine's LAN IP shown in the dashboard pairing card.
+
+HTI (hour index, 2026-09-06):
+
+- `hourly_index` is a pipeline toggle (default OFF). The worker indexes closed
+  hours only during intake-idle sweeps, max 2 per pass, via
+  `HourlyIndexer.build_missing()`.
+- Cloud reasoning stages are skipped for indexing (egress guard) — never relax
+  this silently.
+- `num_gpu` accepts an explicit auto-reset: `null` / `""` / `"auto"` all clear
+  the saved layer count back to `None` (Ollama auto-placement). The web UI's
+  ↺ button and an emptied gpu-layers field rely on this.

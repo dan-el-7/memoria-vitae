@@ -55,6 +55,8 @@ Answer the user's questions using the tools:
   matching; use mode='semantic' when the user paraphrases ('where was the calculator' may match
   observations never containing the word 'calculator').
 - get_observations_in_time_range for WHEN, get_location_history for WHERE.
+- get_timeline_index FIRST for broad multi-hour questions: compact per-hour digests;
+  fall back to the row tools only for windows the index does not cover.
 - get_observation for full detail of one id; observations are ordered history — semantically
   similar observations are NOT duplicates (e.g. an object at 12:01, 12:04, 12:07 is a story).
 - get_observation_image attaches a stored image for visual inspection. Use it only when visual

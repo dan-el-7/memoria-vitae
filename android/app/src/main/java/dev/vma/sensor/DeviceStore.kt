@@ -28,6 +28,24 @@ class DeviceStore(context: Context) {
         get() = prefs.getBoolean("continuous_audio", false)
         set(value) = prefs.edit().putBoolean("continuous_audio", value).apply()
 
+    /**
+     * Keep Awake: while the app is open, hold the screen on so streaming +
+     * preview continue uninterrupted. Without it the screen may time out
+     * (the foreground service keeps sensing either way).
+     */
+    var keepAwake: Boolean
+        get() = prefs.getBoolean("keep_awake", false)
+        set(value) = prefs.edit().putBoolean("keep_awake", value).apply()
+
+    /**
+     * Power saving for Keep Awake: black the screen (brightness floor + full
+     * black overlay, tap to peek) instead of keeping the preview visible.
+     * Default ON — an OLED/AMOLED panel at black uses a fraction of the power.
+     */
+    var keepAwakePowerSave: Boolean
+        get() = prefs.getBoolean("keep_awake_power_save", true)
+        set(value) = prefs.edit().putBoolean("keep_awake_power_save", value).apply()
+
     val isPaired: Boolean get() = !deviceToken.isNullOrBlank()
 
     fun unpair() {
