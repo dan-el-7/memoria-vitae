@@ -1,0 +1,428 @@
+commit 0c8343377051d29529d4d6b165106bd189715438
+Author: dan-el-7 <danyaelgaina1@gmail.com>
+Date:   Sun Sep 6 02:51:54 2026 +0530
+
+    v0.2.2: mark-this-moment, event segmentation, cross-run search, at-rest encryption
+
+diff --git a/desktop/vma/app.py b/desktop/vma/app.py
+index 7f0452d..6a8813a 100644
+--- a/desktop/vma/app.py
++++ b/desktop/vma/app.py
+@@ -29,7 +29,7 @@ from .runs.manager import Run, RunManager
+ from .security.pairing import PairingManager
+ from .server.sensor import SensorHub
+ from .stt import FasterWhisperStt, SttUnavailable
+-from .utils import iso, lan_address_candidates, pairing_uri, utcnow
++from .utils import iso, lan_address_candidates, pairing_uri, utcnow, utcnow_minus
+ 
+ STATIC_DIR = Path(__file__).parent / "static"
+ 
+@@ -53,6 +53,9 @@ class AppState:
+         self.relay_channel_id: str | None = None
+         self.relay_connected = False
+         self.relay_status = "disabled"
++        self._fernet = _load_fernet(cfg.server.data_dir, cfg.server.encrypt_observations)
++        if self._fernet is not None:
++            self.run_manager.set_fernet(self._fernet)
+         self._make_providers()
+ 
+     # ----------------------------------------------------------- providers
+@@ -165,6 +168,10 @@ class AppState:
+                 "enabled": self.stt is not None,
+                 "model": self.cfg.stt.model,
+             },
++            "encryption": {
++                "enabled": self._fernet is not None,
++                "configured": self.cfg.server.encrypt_observations,
++            },
+             "config": {
+                 "vision": _cfg_dict(self.cfg.vision),
+                 "reasoning": _cfg_dict(self.cfg.reasoning),
+@@ -207,6 +214,33 @@ def _cfg_dict(p: ProviderConfig) -> dict[str, Any]:
+     return out
+ 
+ 
++def _load_fernet(data_dir: Path, enabled: bool):
++    """Load the at-rest encryption key (or None). The key file is created only
++    when the user explicitly enables encryption; losing it locks old data."""
++    if not enabled:
++        return None
++    key_path = Path(data_dir) / "secret.key"
++    try:
++        if key_path.exists():
++            from cryptography.fernet import Fernet
++            return Fernet(key_path.read_bytes().strip())
++    except Exception:
++        return None
++    return None
++
++
++def _enable_encryption(data_dir: Path) -> Any:
++    """Generate (once) and return a Fernet backed by <data_dir>/secret.key."""
++    from cryptography.fernet import Fernet
++
++    key_path = Path(data_dir) / "secret.key"
++    key_path.parent.mkdir(parents=True, exist_ok=True)
++    if not key_path.exists():
++        key = Fernet.generate_key()
++        key_path.write_bytes(key)
++    return Fernet(key_path.read_bytes().strip())
++
++
+ def save_config_toml(cfg: AppConfig) -> None:
+     """Persist current config to config.toml next to the package root."""
+     def prov(p: ProviderConfig) -> str:
+@@ -266,6 +300,7 @@ host = "{cfg.server.host}"
+ port = {cfg.server.port}
+ relay_url = "{cfg.server.relay_url}"
+ relay_reg_token = "{cfg.server.relay_reg_token}"
++encrypt_observations = {str(cfg.server.encrypt_observations).lower()}
+ """
+     (Path(__file__).resolve().parent.parent / "config.toml").write_text(content, encoding="utf-8")
+ 
+@@ -469,7 +504,23 @@ async def pause_run(body: dict[str, Any]) -> dict[str, Any]:
+ # desktop execution — every command maps to an existing sandboxed action.
+ 
+ COMMAND_ALLOWLIST = {"get_status", "pause", "resume", "stop_run", "append_note", "chat",
+-                     "get_observations", "get_observation_image", "list_runs"}
++                     "get_observations", "get_observation_image", "list_runs", "mark_moment"}
++
++
++def _run_lookup(st: AppState):
++    """Cross-run search source: (run_id, name, db_path) for every run on disk."""
++    def lookup() -> list[dict[str, Any]]:
++        out = []
++        for r in st.run_manager.list_runs():
++            if not r.get("has_db"):
++                continue
++            out.append({
++                "run_id": r["run_id"],
++                "name": r.get("name") or r["run_id"],
++                "db_path": str(st.run_manager.runs_dir / r["run_id"] / "observations.db"),
++            })
++        return out
++    return lookup
+ 
+ 
+ def _resolve_command_run(st: AppState, args: dict[str, Any]):
+@@ -530,6 +581,20 @@ async def execute_command(st: AppState, command: str, args: dict[str, Any]) -> d
+             raise LookupError("no active run")
+         note_id = st.current_run.store.add_note(text, author="user")
+         return {"note_id": note_id}
++    if command == "mark_moment":
++        # "That matters, remember it": bump importance of observations
++        # committed in the last `window_seconds` so retrieval can prioritize
++        # them (importance_min filters) and media eviction protects them.
++        run = _resolve_command_run(st, args)
++        window_s = int(args.get("window_seconds") or 60)
++        window_s = max(10, min(window_s, 3600))
++        cutoff = iso(utcnow_minus(minutes=window_s / 60))
++        marked = run.store.bump_importance_since(cutoff, min_importance=3)
++        note_id = run.store.add_note(
++            f"user marked moment at {iso()} (last {window_s}s: {marked} observation(s))",
++            author="user",
++        )
++        return {"marked": marked, "note_id": note_id, "window_seconds": window_s}
+     if command == "chat":
+         text = str(args.get("text") or "").strip()
+         if not text:
+@@ -537,7 +602,7 @@ async def execute_command(st: AppState, command: str, args: dict[str, Any]) -> d
+         if st.reasoning is None:
+             raise LookupError("no reasoning provider")
+         run = _resolve_command_run(st, args)
+-        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder)
++        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder, run_lookup=_run_lookup(st))
+         outcome = await run_chat(st.reasoning, ctx, text)
+         return {"answer": outcome.answer, "tool_calls": [t["name"] for t in outcome.tool_trace]}
+     if command == "list_runs":
+@@ -584,7 +649,9 @@ async def execute_command(st: AppState, command: str, args: dict[str, Any]) -> d
+         path = run.media_path(media_rel)
+         if path is None:
+             raise LookupError("media file missing on disk")
+-        data = path.read_bytes()
++        data = run.read_media(media_rel)
++        if data is None:
++            raise LookupError("media file missing on disk")
+         if len(data) > 6_000_000:
+             raise ValueError("image too large to send")
+         import base64 as _b64
+@@ -674,6 +741,32 @@ async def set_pipeline_config(body: dict[str, Any]) -> dict[str, Any]:
+     return {"ok": True, "applied": applied}
+ 
+ 
++@app.post("/api/security/encryption")
++async def set_encryption(body: dict[str, Any]) -> dict[str, Any]:
++    """Opt-in at-rest encryption: encrypt the payload column (screen text,
++    transcripts) and retained media with a Fernet key stored in the data dir.
++
++    Enabling generates <data_dir>/secret.key once and applies transparently to
++    new writes everywhere; legacy plaintext rows stay readable. Disabling
++    stops encrypting NEW writes but does not decrypt existing data (and the
++    key file is kept — deleting it permanently locks encrypted data).
++    """
++    st = get_state()
++    enabled = bool(body.get("enabled"))
++    st.cfg.server.encrypt_observations = enabled
++    if enabled:
++        st._fernet = _enable_encryption(st.cfg.server.data_dir)
++    else:
++        st._fernet = _load_fernet(st.cfg.server.data_dir, enabled=False)
++    st.run_manager.set_fernet(st._fernet)
++    if st.current_run is not None:
++        st.current_run.fernet = st._fernet
++    save_config_toml(st.cfg)
++    return {"ok": True, "enabled": enabled,
++            "note": None if enabled else "existing encrypted rows stay encrypted; "
++                                         "do not delete secret.key while they exist"}
++
++
+ # ------------------------------------------------------------------- voice
+ 
+ @app.post("/api/voice/transcribe")
+@@ -697,7 +790,8 @@ async def voice_transcribe(request: Request, send_to_agent: bool = False) -> dic
+         if st.current_run is None or st.reasoning is None:
+             out["agent_error"] = "no active run"
+         else:
+-            ctx = ToolContext(run=st.current_run, vision=st.vision, embedder=st.embedder)
++            ctx = ToolContext(run=st.current_run, vision=st.vision, embedder=st.embedder,
++                              run_lookup=_run_lookup(st))
+             try:
+                 outcome = await run_chat(st.reasoning, ctx, result.text)
+                 out["agent_answer"] = outcome.answer
+@@ -774,6 +868,10 @@ async def _commit_voice_note(st: AppState, result: Any, *, source: str = "push_t
+     )
+     if vec is not None:
+         run.store.set_observation_embedding(obs_id, len(vec), st.embedder.model, vec_to_bytes(vec))
++    # Voice notes join the open event segment like any other observation.
++    worker = getattr(st, "worker", None)
++    if worker is not None:
++        worker.track_observation(obs_id, ts, "voice_note", 2)
+     return {"observation_id": obs_id, "links": linked_ids,
+             "link_counts": {"temporal": len(temporal_ids), "semantic": len(semantic_ids)}}
+ 
+@@ -841,13 +939,17 @@ async def run_observations(run_id: str, limit: int = 100, min_importance: int =
+ 
+ 
+ @app.get("/api/runs/{run_id}/media/{rel_path:path}")
+-async def run_media(run_id: str, rel_path: str) -> FileResponse:
+-    """Serve a stored frame image; path traversal is rejected."""
++async def run_media(run_id: str, rel_path: str) -> Response:
++    """Serve a stored frame image (transparently decrypted if at-rest
++    encryption is on); path traversal is rejected."""
+     run = _open_or_404(run_id)
+-    path = get_state().run_manager.run_media_path(run, rel_path)
+-    if path is None:
++    try:
++        data = run.read_media(rel_path)
++    except PermissionError as exc:
++        raise HTTPException(503, str(exc))
++    if data is None:
+         raise HTTPException(404, "media not found")
+-    return FileResponse(path, media_type="image/jpeg")
++    return Response(content=data, media_type="image/jpeg")
+ 
+ 
+ @app.delete("/api/runs/{run_id}/media")
+@@ -995,7 +1097,7 @@ async def _handle_ui_message(ws: WebSocket, msg: dict[str, Any]) -> None:
+         if run is None:
+             await ws.send_text(json.dumps({"type": "chat_error", "message": "run not found"}))
+             return
+-        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder)
++        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder, run_lookup=_run_lookup(st))
+         try:
+             outcome = await run_chat(
+                 st.reasoning, ctx, text,
+@@ -1020,7 +1122,7 @@ async def _handle_ui_message(ws: WebSocket, msg: dict[str, Any]) -> None:
+         if run is None:
+             await _ws_send(ws, {"type": "chat_error", "message": "run not found"})
+             return
+-        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder)
++        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder, run_lookup=_run_lookup(st))
+         instruction = (
+             f"Generate a {kind} report for this run using the observation store. "
+             "Retrieve the data you need, then call create_report with a well-structured "
+diff --git a/desktop/vma/pipeline/worker.py b/desktop/vma/pipeline/worker.py
+index 75c8402..c49d1e2 100644
+--- a/desktop/vma/pipeline/worker.py
++++ b/desktop/vma/pipeline/worker.py
+@@ -24,7 +24,7 @@ from PIL import Image
+ from ..config import PipelineConfig
+ from ..providers.base import VisionProvider
+ from ..store.db import RunStore
+-from ..utils import clamp, ema, iso, utcnow_minus
++from ..utils import clamp, ema, iso, parse_iso, utcnow_minus
+ from .change import ChangeDetector
+ from .intake import Frame, FrameIntake
+ from .perceive import flatten_observation, issue_count, perceive
+@@ -82,6 +82,23 @@ def _top_confidence(vlm: dict[str, Any]) -> float | None:
+     return max(confs) if confs else None
+ 
+ 
++def _ts_gap_seconds(a: str, b: str) -> float | None:
++    """Seconds from ISO timestamp a to b (None if either is unparseable)."""
++    try:
++        return (parse_iso(b) - parse_iso(a)).total_seconds()
++    except (ValueError, TypeError):
++        return None
++
++
++def _dominant_scene(scenes: list[str]) -> str | None:
++    """Most common non-empty scene label in an event (ties: first seen)."""
++    counts: dict[str, int] = {}
++    for s in scenes:
++        if s:
++            counts[s] = counts.get(s, 0) + 1
++    return max(counts, key=counts.get) if counts else None
++
++
+ class PipelineWorker:
+     def __init__(
+         self,
+@@ -117,6 +134,7 @@ class PipelineWorker:
+         self._last_media_sweep_mono = 0.0
+         self._last_index_sweep_mono = 0.0
+         self._index_task: asyncio.Task[None] | None = None
++        self._event: dict[str, Any] | None = None  # open event segment (see _track_event)
+ 
+     # ------------------------------------------------------------ lifecycle
+ 
+@@ -137,6 +155,10 @@ class PipelineWorker:
+         if self._index_task is not None and not self._index_task.done():
+             self._index_task.cancel()
+         self._index_task = None
++        try:
++            self._flush_event()  # close the open event segment
++        except Exception:
++            pass
+         self.status.running = False
+ 
+     # --------------------------------------------------------------- input
+@@ -259,6 +281,9 @@ class PipelineWorker:
+             self._save_media(frame_id, obs_id, frame.jpeg, importance)
+             self._enforce_media_budget()
+ 
++        # Derived, additive event tracking (scene runs split by time gaps).
++        self._track_event(obs_id, payload.get("timestamp") or iso(), vlm.get("scene"), importance)
++
+         # Embedding runs once per COMMITTED observation — never per frame.
+         await self._embed_observation(obs_id, payload)
+ 
+@@ -277,6 +302,50 @@ class PipelineWorker:
+ 
+     # ----------------------------------------------------------- internals
+ 
++    # ---- event segmentation (derived, additive) ----
++
++    def track_observation(self, obs_id: int, ts: str, scene: str | None,
++                          importance: int) -> None:
++        """Public hook so non-frame commits (voice notes) join events too."""
++        self._track_event(obs_id, ts, scene, importance)
++
++    def flush_event(self) -> None:
++        self._flush_event()
++
++    def _track_event(self, obs_id: int, ts: str, scene: str | None, importance: int) -> None:
++        if self._event is None:
++            self._event = {"start": ts, "last": ts, "n": 1,
++                           "scenes": [scene] if scene else [],
++                           "rep": (obs_id, importance)}
++            return
++        gap = _ts_gap_seconds(self._event["last"], ts)
++        duration = _ts_gap_seconds(self._event["start"], ts)
++        if (gap is None or gap > self.cfg.event_gap_minutes * 60
++                or duration is None or duration > self.cfg.event_max_minutes * 60):
++            self._flush_event()
++            self._event = {"start": ts, "last": ts, "n": 1,
++                           "scenes": [scene] if scene else [],
++                           "rep": (obs_id, importance)}
++            return
++        self._event["last"] = ts
++        self._event["n"] += 1
++        if scene:
++            self._event["scenes"].append(scene)
++        if importance > self._event["rep"][1]:
++            self._event["rep"] = (obs_id, importance)
++
++    def _flush_event(self) -> None:
++        ev = self._event
++        self._event = None
++        if not ev:
++            return
++        title = _dominant_scene(ev["scenes"]) or f"{ev['n']} observation(s)"
++        self.store.add_event(
++            start_ts=ev["start"], end_ts=ev["last"], title=title,
++            n_obs=ev["n"], rep_obs_id=ev["rep"][0],
++        )
++        self.store.add_metric("event_built", 1, {"n_obs": ev["n"]})
++
+     def _observation_text(self, payload: dict[str, Any]) -> str:
+         """Flat text summary embedded for semantic retrieval."""
+         vlm = payload.get("vlm") or {}
+@@ -406,7 +475,7 @@ class PipelineWorker:
+                 img.thumbnail((max_side, max_side))
+             buf = io.BytesIO()
+             img.convert("RGB").save(buf, format="JPEG", quality=self.cfg.media_jpeg_quality)
+-            data = buf.getvalue()
++            data = self.store.encrypt_media(buf.getvalue())  # at-rest encryption (no-op if off)
+             digest = hashlib.sha256(data).hexdigest()[:16]
+             rel = f"media/obs{obs_id:06d}_i{importance}_{digest}.jpg"
+             path = self.run_dir / rel
+diff --git a/desktop/vma/runs/manager.py b/desktop/vma/runs/manager.py
+index 884f07d..0bc91ed 100644
+--- a/desktop/vma/runs/manager.py
++++ b/desktop/vma/runs/manager.py
+@@ -47,6 +47,21 @@ class Run:
+             return None
+         return candidate
+ 
++    def read_media(self, rel: str) -> bytes | None:
++        """Read retained media, transparently decrypting at-rest encryption."""
++        path = self.media_path(rel)
++        if path is None:
++            return None
++        return self.store.decrypt_media(path.read_bytes())
++
++    @property
++    def fernet(self):
++        return self.store.fernet
++
++    @fernet.setter
++    def fernet(self, value) -> None:
++        self.store.set_fernet(value)
++
+     def save_metadata(self) -> None:
+         write_json(self.dir / METADATA_FILE, self.meta)
+ 
+@@ -62,6 +77,7 @@ class RunManager:
+         self.cfg = cfg
+         self.runs_dir = cfg.runs_dir
+         self.runs_dir.mkdir(parents=True, exist_ok=True)
++        self._fernet = None  # at-rest encryption key, applied to every opened run
+ 
+     # ------------------------------------------------------------- create
+ 
+@@ -103,6 +119,8 @@ class RunManager:
+         }
+         write_json(run_dir / METADATA_FILE, meta)
+         run = Run(run_id, run_dir, meta)
++        if self._fernet is not None:
++            run.fernet = self._fernet
+         return run
+ 
+     # -------------------------------------------------------------- list
+@@ -138,7 +156,14 @@ class RunManager:
+         if not meta_path.exists():
+             return None
+         meta = read_json(meta_path)
+-        return Run(run_id, run_dir, meta)
++        run = Run(run_id, run_dir, meta)
++        if self._fernet is not None:
++            run.fernet = self._fernet
++        return run
++
++    def set_fernet(self, fernet) -> None:
++        """Attach/detach at-rest encryption for all future opened runs."""
++        self._fernet = fernet
+ 
+     def delete_run(self, run_id: str) -> bool:
+         """Permanently delete a run directory (observations + media)."""
