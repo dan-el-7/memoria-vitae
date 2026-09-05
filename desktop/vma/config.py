@@ -69,6 +69,11 @@ class PipelineConfig:
     # fast path for broad agent queries. Adds an index only — rows are never
     # merged/deleted. Skipped automatically if the reasoning stage is cloud.
     hourly_index: bool = False
+    # Event segmentation: consecutive observations join the same event while
+    # gaps stay under event_gap_minutes; events cap at event_max_minutes.
+    # Purely additive derived rows (events table), no LLM involved.
+    event_gap_minutes: float = 5.0
+    event_max_minutes: float = 30.0
 
 
 @dataclass
@@ -105,6 +110,10 @@ class ServerConfig:
     # Relay / Internet pairing (M4). Empty relay_url = LAN-only mode.
     relay_url: str = ""
     relay_reg_token: str = ""
+    # At-rest encryption of observation payloads + retained media (Fernet,
+    # key in <data_dir>/secret.key). Opt-in; keyword search then covers
+    # summary+scene only (payload ciphertext is not FTS-indexed).
+    encrypt_observations: bool = False
 
 
 @dataclass

@@ -3,6 +3,12 @@
 Sync sqlite3 (fast enough at ~1 observation/second) executed on the worker
 thread; async callers wrap with asyncio.to_thread. FTS5 is used for keyword
 search with a LIKE fallback if the runtime lacks it.
+
+Optional at-rest encryption: when a Fernet key is attached (`fernet`), the
+`payload` column (the sensitive screen_text-bearing JSON) is stored encrypted
+(prefix `enc1:`), and retained media files written by the worker get a
+`VMAENC1:` magic prefix. Keyword search still covers `summary` + `scene`; the
+payload-prefix FTS branch is disabled while encryption is on.
 """
 
 from __future__ import annotations
@@ -18,6 +24,9 @@ from ..utils import iso, local_iso, parse_iso
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
+PAYLOAD_ENC_PREFIX = "enc1:"
+MEDIA_ENC_PREFIX = b"VMAENC1:"
+
 
 class RunStore:
     def __init__(self, db_path: Path) -> None:
@@ -30,8 +39,90 @@ class RunStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         self._conn.commit()
+        self.fernet: Any | None = None  # cryptography.fernet.Fernet, opt-in
         self._fts_enabled = self._probe_fts()
         self._migrate_local_ts()
+
+    # ------------------------------------------------------------ encryption
+
+    def set_fernet(self, fernet: Any | None) -> None:
+        """Attach/detach at-rest encryption. Reads of legacy plaintext rows
+        keep working; rows stay encrypted on disk once written that way."""
+        self.fernet = fernet
+        self._apply_fts_trigger()
+
+    def encrypt_payload(self, payload_json: str) -> str:
+        if self.fernet is None:
+            return payload_json
+        return PAYLOAD_ENC_PREFIX + self.fernet.encrypt(payload_json.encode("utf-8")).decode("ascii")
+
+    def decrypt_payload(self, stored: str | None) -> str | None:
+        if stored is None:
+            return None
+        if stored.startswith(PAYLOAD_ENC_PREFIX):
+            if self.fernet is None:
+                return json.dumps({"encrypted": True,
+                                   "note": "encryption key unavailable — data is locked"})
+            try:
+                return self.fernet.decrypt(stored[len(PAYLOAD_ENC_PREFIX):].encode("ascii")).decode("utf-8")
+            except Exception:
+                return json.dumps({"encrypted": True,
+                                   "note": "decryption failed — wrong key?"})
+        return stored
+
+    def encrypt_media(self, data: bytes) -> bytes:
+        if self.fernet is None:
+            return data
+        return MEDIA_ENC_PREFIX + self.fernet.encrypt(data)
+
+    def decrypt_media(self, data: bytes) -> bytes:
+        if data.startswith(MEDIA_ENC_PREFIX):
+            if self.fernet is None:
+                raise PermissionError("media is encrypted but no key is loaded")
+            try:
+                return self.fernet.decrypt(data[len(MEDIA_ENC_PREFIX):])
+            except Exception as exc:
+                raise PermissionError(f"media decryption failed (wrong key?): {exc}") from exc
+        return data
+
+    def _apply_fts_trigger(self) -> None:
+        """While payload encryption is on, FTS indexes summary+scene only —
+        ciphertext would poison the payload-prefix branch of the trigger.
+        The delete trigger must mirror the insert trigger exactly."""
+        if not self._fts_enabled:
+            return
+        try:
+            self._conn.execute("DROP TRIGGER IF EXISTS obs_ai")
+            self._conn.execute("DROP TRIGGER IF EXISTS obs_ad")
+            if self.fernet is None:
+                self._conn.execute(
+                    """CREATE TRIGGER obs_ai AFTER INSERT ON observations BEGIN
+                       INSERT INTO observation_fts(rowid, summary, detail)
+                       VALUES (new.id, new.summary, substr(new.payload, 1, 4000));
+                       END"""
+                )
+                self._conn.execute(
+                    """CREATE TRIGGER obs_ad AFTER DELETE ON observations BEGIN
+                       INSERT INTO observation_fts(observation_fts, rowid, summary, detail)
+                       VALUES ('delete', old.id, old.summary, substr(old.payload, 1, 4000));
+                       END"""
+                )
+            else:
+                self._conn.execute(
+                    """CREATE TRIGGER obs_ai AFTER INSERT ON observations BEGIN
+                       INSERT INTO observation_fts(rowid, summary)
+                       VALUES (new.id, coalesce(new.summary, '') || ' ' || coalesce(new.scene, ''));
+                       END"""
+                )
+                self._conn.execute(
+                    """CREATE TRIGGER obs_ad AFTER DELETE ON observations BEGIN
+                       INSERT INTO observation_fts(observation_fts, rowid, summary)
+                       VALUES ('delete', old.id, coalesce(old.summary, '') || ' ' || coalesce(old.scene, ''));
+                       END"""
+                )
+            self._conn.commit()
+        except sqlite3.Error:
+            pass
 
     def _probe_fts(self) -> bool:
         try:
@@ -203,21 +294,22 @@ class RunStore:
                    importance_reason, confidence, payload, model, provider, latency_ms)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (frame_id, ts, iso(), local_ts, kind, scene, summary, importance, importance_reason,
-             confidence, json.dumps(payload, ensure_ascii=False), model, provider, latency_ms),
+             confidence, self.encrypt_payload(json.dumps(payload, ensure_ascii=False)),
+             model, provider, latency_ms),
         )
         self._conn.commit()
         return int(cur.lastrowid)
 
     def get_observation(self, obs_id: int) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM observations WHERE id=?", (obs_id,)).fetchone()
-        return _obs(row)
+        return self._obs(row)
 
     def observations_in_range(self, start: str, end: str, *, limit: int = 500) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT * FROM observations WHERE ts >= ? AND ts <= ? ORDER BY ts LIMIT ?",
             (start, end, limit),
         ).fetchall()
-        return [_obs(r) for r in rows]
+        return [self._obs(r) for r in rows]
 
     def search_observations(self, query: str, *, start: str | None = None, end: str | None = None,
                             importance_min: int = 0, limit: int = 30) -> list[dict[str, Any]]:
@@ -231,7 +323,7 @@ class RunStore:
                        ORDER BY rank LIMIT ?""",
                     (query, importance_min, limit),
                 ).fetchall()
-                results = [_obs(r) for r in rows]
+                results = [self._obs(r) for r in rows]
             except sqlite3.Error:
                 results = []
             if results:
@@ -243,7 +335,7 @@ class RunStore:
                ORDER BY ts DESC LIMIT ?""",
             (importance_min, like, like, limit * 2),
         ).fetchall()
-        return self._maybe_filter_time([_obs(r) for r in rows], start, end)[:limit]
+        return self._maybe_filter_time([self._obs(r) for r in rows], start, end)[:limit]
 
     @staticmethod
     def _maybe_filter_time(rows: list[dict[str, Any]], start: str | None, end: str | None) -> list[dict[str, Any]]:
@@ -255,7 +347,7 @@ class RunStore:
         rows = self._conn.execute(
             "SELECT * FROM observations ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
-        return [_obs(r) for r in reversed(rows)]
+        return [self._obs(r) for r in reversed(rows)]
 
     # ---------------------------------------------------------- embeddings
 
@@ -315,7 +407,7 @@ class RunStore:
         scored.sort(key=lambda t: t[0], reverse=True)
         out = []
         for score, row in scored[:limit]:
-            obs = _obs(row)
+            obs = self._obs(row)
             if obs is None:
                 continue
             obs["similarity"] = round(score, 4)
@@ -461,7 +553,20 @@ class RunStore:
             "last_ts": last,
             "notes": one("SELECT COUNT(*) FROM notes"),
             "reports": one("SELECT COUNT(*) FROM reports"),
+            "events": one("SELECT COUNT(*) FROM events"),
+            "hours_indexed": one("SELECT COUNT(*) FROM hour_index"),
         }
+
+    def bump_importance_since(self, cutoff_ts: str, *, min_importance: int = 3) -> int:
+        """Raise importance of observations committed after `cutoff_ts` (server
+        clock, `ts_server`) up to at least `min_importance`. Never lowers."""
+        cur = self._conn.execute(
+            """UPDATE observations SET importance = ?
+               WHERE ts_server >= ? AND importance < ?""",
+            (min_importance, cutoff_ts, min_importance),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
 
     # ------------------------------------------------- hour index (HTI)
 
@@ -523,13 +628,53 @@ class RunStore:
     def hour_index_count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM hour_index").fetchone()[0])
 
+    # ------------------------------------------------------ events (derived)
+
+    def add_event(self, *, start_ts: str, end_ts: str, title: str, n_obs: int,
+                  rep_obs_id: int | None) -> int:
+        cur = self._conn.execute(
+            """INSERT INTO events (start_ts, end_ts, title, n_obs, rep_obs_id, created_ts)
+               VALUES (?,?,?,?,?,?)""",
+            (start_ts, end_ts, title[:200], n_obs, rep_obs_id, iso()),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def events_in_range(self, start: str | None = None, end: str | None = None,
+                        limit: int = 100) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM events"
+        conds, args = [], []
+        if start:
+            conds.append("end_ts >= ?")
+            args.append(start)
+        if end:
+            conds.append("start_ts <= ?")
+            args.append(end)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY start_ts LIMIT ?"
+        args.append(limit)
+        return [dict(r) for r in self._conn.execute(sql, args).fetchall()]
+
+    def _obs(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out.pop("vec", None)
+        out["payload"] = self.decrypt_payload(out["payload"])
+        try:
+            out["payload"] = json.loads(out["payload"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return out
+
     # ------------------------------------------------------------- delete
 
     def delete_all(self) -> None:
         """Wipe run contents (used when a run is deleted)."""
         for table in ("observation_fts", "observation_vec", "observations", "media", "frames",
                       "location_samples", "notes", "chat_messages", "metrics", "device_events",
-                      "reports", "hour_index"):
+                      "reports", "hour_index", "events"):
             if table == "observation_fts":
                 try:
                     self._conn.execute("DELETE FROM observation_fts")
@@ -554,15 +699,3 @@ def vec_to_bytes(vec: list[float]) -> bytes:
 def _vec_to_floats(blob: bytes | memoryview) -> list[float]:
     count = len(blob) // 4
     return list(struct.unpack(f"<{count}f", bytes(blob[: count * 4])))
-
-
-def _obs(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    if row is None:
-        return None
-    out = dict(row)
-    out.pop("vec", None)
-    try:
-        out["payload"] = json.loads(out["payload"])
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return out

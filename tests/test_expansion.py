@@ -281,7 +281,7 @@ class TestCommandAuthorization:
         from vma.app import COMMAND_ALLOWLIST
         assert COMMAND_ALLOWLIST == {
             "get_status", "pause", "resume", "stop_run", "append_note", "chat",
-            "get_observations", "get_observation_image", "list_runs",
+            "get_observations", "get_observation_image", "list_runs", "mark_moment",
         }
         for cmd in ("shell", "exec", "eval", "run", "delete_run", ""):
             assert cmd not in COMMAND_ALLOWLIST

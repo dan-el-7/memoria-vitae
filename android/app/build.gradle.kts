@@ -11,8 +11,8 @@ android {
         applicationId = "dev.vma.sensor"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.2.1"
+        versionCode = 4
+        versionName = "0.2.2"
     }
 
     buildTypes {

@@ -47,6 +47,21 @@ class Run:
             return None
         return candidate
 
+    def read_media(self, rel: str) -> bytes | None:
+        """Read retained media, transparently decrypting at-rest encryption."""
+        path = self.media_path(rel)
+        if path is None:
+            return None
+        return self.store.decrypt_media(path.read_bytes())
+
+    @property
+    def fernet(self):
+        return self.store.fernet
+
+    @fernet.setter
+    def fernet(self, value) -> None:
+        self.store.set_fernet(value)
+
     def save_metadata(self) -> None:
         write_json(self.dir / METADATA_FILE, self.meta)
 
@@ -62,6 +77,7 @@ class RunManager:
         self.cfg = cfg
         self.runs_dir = cfg.runs_dir
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self._fernet = None  # at-rest encryption key, applied to every opened run
 
     # ------------------------------------------------------------- create
 
@@ -103,6 +119,8 @@ class RunManager:
         }
         write_json(run_dir / METADATA_FILE, meta)
         run = Run(run_id, run_dir, meta)
+        if self._fernet is not None:
+            run.fernet = self._fernet
         return run
 
     # -------------------------------------------------------------- list
@@ -138,7 +156,14 @@ class RunManager:
         if not meta_path.exists():
             return None
         meta = read_json(meta_path)
-        return Run(run_id, run_dir, meta)
+        run = Run(run_id, run_dir, meta)
+        if self._fernet is not None:
+            run.fernet = self._fernet
+        return run
+
+    def set_fernet(self, fernet) -> None:
+        """Attach/detach at-rest encryption for all future opened runs."""
+        self._fernet = fernet
 
     def delete_run(self, run_id: str) -> bool:
         """Permanently delete a run directory (observations + media)."""

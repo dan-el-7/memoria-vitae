@@ -154,3 +154,30 @@ Notes: local reasoning models only (cloud reasoning stages are skipped — the
 digest would ship observation text off-machine); backfill is progressive,
 oldest hours first; the open hour is indexed only after it closes; raw
 observations are never altered.
+
+## Mark this moment (phone)
+
+The Sensor tab has a **Mark this moment** button. It sends the allowlisted
+`mark_moment` command (`window_seconds`, default 60): the desktop raises the
+importance of everything committed in that window to 3 (retrieval
+`importance_min` filters pick it up, media eviction protects the frames) and
+appends a user note. Say something with hold-to-talk right before/after to
+attach context.
+
+## Cross-run search
+
+The agent's `search_all_runs` tool keyword-searches every run's DB on the
+machine (read-only, most recent 20 runs) so questions like "which day was I in
+the garage" work across sessions. Drill-down stays per-run.
+
+## Encryption at rest
+
+Toggle: dashboard **Encryption at rest** card or `POST /api/security/encryption`.
+When enabled, a Fernet key is generated once at `data/secret.key` and applied
+transparently to new writes: the observation `payload` column (screen text,
+transcripts) is stored as `enc1:` ciphertext and retained media files get a
+`VMAENC1:` prefix. Consequences: keyword search then covers summary + scene
+only (payload ciphertext is not FTS-indexed); legacy plaintext rows remain
+readable; disabling stops encrypting new writes but never decrypts existing
+data. **Do not delete `secret.key` while encrypted rows exist** — they become
+permanently unreadable (tests: `test_v022_features.py`).

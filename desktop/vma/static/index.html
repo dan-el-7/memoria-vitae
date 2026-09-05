@@ -119,6 +119,20 @@
         observations into a short digest the agent can use instead of scanning raw rows.
         Local reasoning models only; raw observations are never changed.</div>
     </div>
+
+    <div class="card">
+      <h3>Encryption at rest</h3>
+      <div class="editor-row">
+        <label><input id="cfg-encrypt" type="checkbox"> encrypt payloads &amp; images</label>
+      </div>
+      <div class="row">
+        <button id="btn-apply-encrypt">Apply</button>
+      </div>
+      <div class="pairing-note">Encrypts the sensitive JSON payloads (screen text, transcripts)
+        and retained images on disk with a key in <code>data/secret.key</code>. Keyword search
+        then covers summaries and scenes only. Legacy plaintext rows stay readable — but losing
+        the key file permanently locks anything already encrypted.</div>
+    </div>
   </div>
 </section>
 

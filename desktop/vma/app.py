@@ -29,7 +29,7 @@ from .runs.manager import Run, RunManager
 from .security.pairing import PairingManager
 from .server.sensor import SensorHub
 from .stt import FasterWhisperStt, SttUnavailable
-from .utils import iso, lan_address_candidates, pairing_uri, utcnow
+from .utils import iso, lan_address_candidates, pairing_uri, utcnow, utcnow_minus
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -53,6 +53,9 @@ class AppState:
         self.relay_channel_id: str | None = None
         self.relay_connected = False
         self.relay_status = "disabled"
+        self._fernet = _load_fernet(cfg.server.data_dir, cfg.server.encrypt_observations)
+        if self._fernet is not None:
+            self.run_manager.set_fernet(self._fernet)
         self._make_providers()
 
     # ----------------------------------------------------------- providers
@@ -165,6 +168,10 @@ class AppState:
                 "enabled": self.stt is not None,
                 "model": self.cfg.stt.model,
             },
+            "encryption": {
+                "enabled": self._fernet is not None,
+                "configured": self.cfg.server.encrypt_observations,
+            },
             "config": {
                 "vision": _cfg_dict(self.cfg.vision),
                 "reasoning": _cfg_dict(self.cfg.reasoning),
@@ -205,6 +212,33 @@ def _cfg_dict(p: ProviderConfig) -> dict[str, Any]:
         out["base_url"] = p.base_url
         out["has_api_key"] = bool(p.api_key)
     return out
+
+
+def _load_fernet(data_dir: Path, enabled: bool):
+    """Load the at-rest encryption key (or None). The key file is created only
+    when the user explicitly enables encryption; losing it locks old data."""
+    if not enabled:
+        return None
+    key_path = Path(data_dir) / "secret.key"
+    try:
+        if key_path.exists():
+            from cryptography.fernet import Fernet
+            return Fernet(key_path.read_bytes().strip())
+    except Exception:
+        return None
+    return None
+
+
+def _enable_encryption(data_dir: Path) -> Any:
+    """Generate (once) and return a Fernet backed by <data_dir>/secret.key."""
+    from cryptography.fernet import Fernet
+
+    key_path = Path(data_dir) / "secret.key"
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if not key_path.exists():
+        key = Fernet.generate_key()
+        key_path.write_bytes(key)
+    return Fernet(key_path.read_bytes().strip())
 
 
 def save_config_toml(cfg: AppConfig) -> None:
@@ -266,6 +300,7 @@ host = "{cfg.server.host}"
 port = {cfg.server.port}
 relay_url = "{cfg.server.relay_url}"
 relay_reg_token = "{cfg.server.relay_reg_token}"
+encrypt_observations = {str(cfg.server.encrypt_observations).lower()}
 """
     (Path(__file__).resolve().parent.parent / "config.toml").write_text(content, encoding="utf-8")
 
@@ -469,7 +504,23 @@ async def pause_run(body: dict[str, Any]) -> dict[str, Any]:
 # desktop execution — every command maps to an existing sandboxed action.
 
 COMMAND_ALLOWLIST = {"get_status", "pause", "resume", "stop_run", "append_note", "chat",
-                     "get_observations", "get_observation_image", "list_runs"}
+                     "get_observations", "get_observation_image", "list_runs", "mark_moment"}
+
+
+def _run_lookup(st: AppState):
+    """Cross-run search source: (run_id, name, db_path) for every run on disk."""
+    def lookup() -> list[dict[str, Any]]:
+        out = []
+        for r in st.run_manager.list_runs():
+            if not r.get("has_db"):
+                continue
+            out.append({
+                "run_id": r["run_id"],
+                "name": r.get("name") or r["run_id"],
+                "db_path": str(st.run_manager.runs_dir / r["run_id"] / "observations.db"),
+            })
+        return out
+    return lookup
 
 
 def _resolve_command_run(st: AppState, args: dict[str, Any]):
@@ -530,6 +581,20 @@ async def execute_command(st: AppState, command: str, args: dict[str, Any]) -> d
             raise LookupError("no active run")
         note_id = st.current_run.store.add_note(text, author="user")
         return {"note_id": note_id}
+    if command == "mark_moment":
+        # "That matters, remember it": bump importance of observations
+        # committed in the last `window_seconds` so retrieval can prioritize
+        # them (importance_min filters) and media eviction protects them.
+        run = _resolve_command_run(st, args)
+        window_s = int(args.get("window_seconds") or 60)
+        window_s = max(10, min(window_s, 3600))
+        cutoff = iso(utcnow_minus(minutes=window_s / 60))
+        marked = run.store.bump_importance_since(cutoff, min_importance=3)
+        note_id = run.store.add_note(
+            f"user marked moment at {iso()} (last {window_s}s: {marked} observation(s))",
+            author="user",
+        )
+        return {"marked": marked, "note_id": note_id, "window_seconds": window_s}
     if command == "chat":
         text = str(args.get("text") or "").strip()
         if not text:
@@ -537,7 +602,7 @@ async def execute_command(st: AppState, command: str, args: dict[str, Any]) -> d
         if st.reasoning is None:
             raise LookupError("no reasoning provider")
         run = _resolve_command_run(st, args)
-        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder)
+        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder, run_lookup=_run_lookup(st))
         outcome = await run_chat(st.reasoning, ctx, text)
         return {"answer": outcome.answer, "tool_calls": [t["name"] for t in outcome.tool_trace]}
     if command == "list_runs":
@@ -584,7 +649,9 @@ async def execute_command(st: AppState, command: str, args: dict[str, Any]) -> d
         path = run.media_path(media_rel)
         if path is None:
             raise LookupError("media file missing on disk")
-        data = path.read_bytes()
+        data = run.read_media(media_rel)
+        if data is None:
+            raise LookupError("media file missing on disk")
         if len(data) > 6_000_000:
             raise ValueError("image too large to send")
         import base64 as _b64
@@ -674,6 +741,32 @@ async def set_pipeline_config(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "applied": applied}
 
 
+@app.post("/api/security/encryption")
+async def set_encryption(body: dict[str, Any]) -> dict[str, Any]:
+    """Opt-in at-rest encryption: encrypt the payload column (screen text,
+    transcripts) and retained media with a Fernet key stored in the data dir.
+
+    Enabling generates <data_dir>/secret.key once and applies transparently to
+    new writes everywhere; legacy plaintext rows stay readable. Disabling
+    stops encrypting NEW writes but does not decrypt existing data (and the
+    key file is kept — deleting it permanently locks encrypted data).
+    """
+    st = get_state()
+    enabled = bool(body.get("enabled"))
+    st.cfg.server.encrypt_observations = enabled
+    if enabled:
+        st._fernet = _enable_encryption(st.cfg.server.data_dir)
+    else:
+        st._fernet = _load_fernet(st.cfg.server.data_dir, enabled=False)
+    st.run_manager.set_fernet(st._fernet)
+    if st.current_run is not None:
+        st.current_run.fernet = st._fernet
+    save_config_toml(st.cfg)
+    return {"ok": True, "enabled": enabled,
+            "note": None if enabled else "existing encrypted rows stay encrypted; "
+                                         "do not delete secret.key while they exist"}
+
+
 # ------------------------------------------------------------------- voice
 
 @app.post("/api/voice/transcribe")
@@ -697,7 +790,8 @@ async def voice_transcribe(request: Request, send_to_agent: bool = False) -> dic
         if st.current_run is None or st.reasoning is None:
             out["agent_error"] = "no active run"
         else:
-            ctx = ToolContext(run=st.current_run, vision=st.vision, embedder=st.embedder)
+            ctx = ToolContext(run=st.current_run, vision=st.vision, embedder=st.embedder,
+                              run_lookup=_run_lookup(st))
             try:
                 outcome = await run_chat(st.reasoning, ctx, result.text)
                 out["agent_answer"] = outcome.answer
@@ -774,6 +868,10 @@ async def _commit_voice_note(st: AppState, result: Any, *, source: str = "push_t
     )
     if vec is not None:
         run.store.set_observation_embedding(obs_id, len(vec), st.embedder.model, vec_to_bytes(vec))
+    # Voice notes join the open event segment like any other observation.
+    worker = getattr(st, "worker", None)
+    if worker is not None:
+        worker.track_observation(obs_id, ts, "voice_note", 2)
     return {"observation_id": obs_id, "links": linked_ids,
             "link_counts": {"temporal": len(temporal_ids), "semantic": len(semantic_ids)}}
 
@@ -841,13 +939,17 @@ async def run_observations(run_id: str, limit: int = 100, min_importance: int = 
 
 
 @app.get("/api/runs/{run_id}/media/{rel_path:path}")
-async def run_media(run_id: str, rel_path: str) -> FileResponse:
-    """Serve a stored frame image; path traversal is rejected."""
+async def run_media(run_id: str, rel_path: str) -> Response:
+    """Serve a stored frame image (transparently decrypted if at-rest
+    encryption is on); path traversal is rejected."""
     run = _open_or_404(run_id)
-    path = get_state().run_manager.run_media_path(run, rel_path)
-    if path is None:
+    try:
+        data = run.read_media(rel_path)
+    except PermissionError as exc:
+        raise HTTPException(503, str(exc))
+    if data is None:
         raise HTTPException(404, "media not found")
-    return FileResponse(path, media_type="image/jpeg")
+    return Response(content=data, media_type="image/jpeg")
 
 
 @app.delete("/api/runs/{run_id}/media")
@@ -995,7 +1097,7 @@ async def _handle_ui_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         if run is None:
             await ws.send_text(json.dumps({"type": "chat_error", "message": "run not found"}))
             return
-        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder)
+        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder, run_lookup=_run_lookup(st))
         try:
             outcome = await run_chat(
                 st.reasoning, ctx, text,
@@ -1020,7 +1122,7 @@ async def _handle_ui_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         if run is None:
             await _ws_send(ws, {"type": "chat_error", "message": "run not found"})
             return
-        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder)
+        ctx = ToolContext(run=run, vision=st.vision, embedder=st.embedder, run_lookup=_run_lookup(st))
         instruction = (
             f"Generate a {kind} report for this run using the observation store. "
             "Retrieve the data you need, then call create_report with a well-structured "

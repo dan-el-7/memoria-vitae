@@ -89,3 +89,13 @@ and stored indefinitely. Treat this as your responsibility:
   builds for them — frames for the vision stage, retrieved observation text
   for the reasoning stage. Stored media is not re-inspected by cloud
   providers.
+
+## At-rest encryption (opt-in)
+
+Enable from the dashboard (Encryption at rest card): the observation `payload`
+column — the most sensitive text, including screen_text and voice transcripts —
+and retained media files are encrypted on disk with a key at `data/secret.key`.
+Encrypted rows are unreadable without the key, and permanently so if the key is
+lost; keyword search then covers summaries and scenes only. Legacy plaintext
+rows stay readable until rewritten; disabling the toggle never decrypts
+existing data.

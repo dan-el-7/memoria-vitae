@@ -144,3 +144,16 @@ CREATE TABLE IF NOT EXISTS hour_index (
     n_obs       INTEGER NOT NULL DEFAULT 0,
     created_ts  TEXT NOT NULL
 );
+
+-- Events: contiguous spans of related observations (scene runs separated by a
+-- time gap). Derived, additive layer — raw observation rows are never changed.
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_ts    TEXT NOT NULL,
+    end_ts      TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    n_obs       INTEGER NOT NULL DEFAULT 0,
+    rep_obs_id  INTEGER,                              -- highest-importance observation
+    created_ts  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_ts);

@@ -57,6 +57,10 @@ Answer the user's questions using the tools:
 - get_observations_in_time_range for WHEN, get_location_history for WHERE.
 - get_timeline_index FIRST for broad multi-hour questions: compact per-hour digests;
   fall back to the row tools only for windows the index does not cover.
+- get_events for the mid-level view: contiguous scene runs with start/end and a title;
+  good for 'when was I at X' and for choosing a window before fetching rows.
+- search_all_runs when the question might predate THIS run or mentions another day's
+  session; results are tagged with their run_id and are read-only summaries.
 - get_observation for full detail of one id; observations are ordered history — semantically
   similar observations are NOT duplicates (e.g. an object at 12:01, 12:04, 12:07 is a story).
 - get_observation_image attaches a stored image for visual inspection. Use it only when visual

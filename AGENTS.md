@@ -198,3 +198,21 @@ HTI (hour index, 2026-09-06):
 - `num_gpu` accepts an explicit auto-reset: `null` / `""` / `"auto"` all clear
   the saved layer count back to `None` (Ollama auto-placement). The web UI's
   ↺ button and an emptied gpu-layers field rely on this.
+
+v0.2.2 features (2026-09-06):
+
+- `mark_moment` is in COMMAND_ALLOWLIST: bumps importance to 3 for rows whose
+  `ts_server` falls in the window (never lowers) + appends a user note.
+  Phone Sensor-tab button posts it via /api/command.
+- Events (`events` table) are derived/additive scene runs (gap
+  `event_gap_minutes` 5m, cap `event_max_minutes` 30m, dominant-scene title,
+  rep = highest-importance member). Voice notes join via
+  `worker.track_observation`; the open event is flushed on worker stop.
+- `search_all_runs` opens each run's store fresh and read-only, keyword only
+  (FTS/LIKE), no embeddings; `ToolContext.run_lookup` supplies
+  (run_id, name, db_path) and must tolerate locked/corrupt run DBs.
+- Encryption at rest (opt-in, `data/secret.key`): `RunStore.set_fernet` swaps
+  the FTS insert/delete trigger pair to summary+scene ONLY — the delete
+  trigger must mirror the insert trigger exactly or the FTS index corrupts.
+  Payload ciphertext prefix `enc1:`, media files `VMAENC1:`. Legacy plaintext
+  rows stay readable; tests must not assume key availability.

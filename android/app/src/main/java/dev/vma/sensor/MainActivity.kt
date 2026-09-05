@@ -268,6 +268,10 @@ class MainActivity : androidx.activity.ComponentActivity() {
                         val o = JSONObject(result.message)
                         "state=${o.optString("run_state")} · connected=${o.optBoolean("sensor_connected")}"
                     }.getOrDefault(result.message)
+                    "mark_moment" -> message.value = runCatching {
+                        val o = JSONObject(result.message)
+                        "★ Marked ${o.optInt("marked")} observation(s) from the last ${o.optInt("window_seconds")}s"
+                    }.getOrDefault(result.message)
                     else -> message.value = result.message.ifBlank { "done" }
                 }
             }
@@ -549,6 +553,18 @@ class MainActivity : androidx.activity.ComponentActivity() {
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
+
+            // "That matters, remember it": bumps importance of the last
+            // minute of observations so retrieval prioritizes them and media
+            // eviction protects their frames.
+            Button(
+                onClick = {
+                    store.serverUrl = serverUrlText.value
+                    sendCommand("mark_moment", JSONObject().put("window_seconds", 60))
+                },
+                enabled = store.isPaired && active,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+            ) { Text("★ Mark this moment") }
 
             // Hold-to-talk voice note → desktop whisper → linked observation.
             val micContainer = if (recording.value) MaterialTheme.colorScheme.errorContainer

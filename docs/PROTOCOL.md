@@ -119,3 +119,10 @@ Relay events are JSON payloads such as `phone_attached`, `phone_detached`, and
 desktop then treats them as the normal phone WebSocket messages above.
 
 The relay currently limits a handshake to 16 KiB and an envelope to 24 MiB.
+
+## `mark_moment` command
+
+Allowlisted command (WS `command` control or `POST /api/command`):
+`{"command": "mark_moment", "args": {"window_seconds": 60}}` →
+`{"marked": <n>, "note_id": <id>, "window_seconds": <s>}`. Raises importance
+to 3 for observations committed in the window and appends a user note.

@@ -50,3 +50,12 @@ entirely when the reasoning stage is a cloud provider (egress guard, metric
 `hour_index_skipped_cloud`); reindexing an hour REPLACES its digest
 (`ON CONFLICT ... DO UPDATE`). The agent reaches it via the
 `get_timeline_index` tool.
+
+## Events (`events` table)
+
+Derived, additive segmentation: consecutive observations join one event while
+the gap stays under `[pipeline] event_gap_minutes` (default 5) and the event
+under `event_max_minutes` (default 30). Columns: `start_ts`, `end_ts`,
+`title` (dominant scene), `n_obs`, `rep_obs_id` (highest-importance member).
+Voice notes join via the same hook. The agent reads them with
+`get_events`; raw rows are never touched.

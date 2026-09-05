@@ -182,6 +182,25 @@ $("#btn-copy-address").addEventListener("click", copyPairingAddress);
 $("#btn-new-code").addEventListener("click", () => generatePairingCode(true));
 
 /* ------------------------- storage policy card ------------------------- */
+$("#btn-apply-encrypt").addEventListener("click", async () => {
+  const enabled = $("#cfg-encrypt").checked;
+  const response = await fetch("/api/security/encryption", { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) });
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`;
+    try { detail = (await response.json()).detail || detail; } catch {}
+    alert(`Encryption change rejected: ${detail}`);
+  } else {
+    const d = await response.json();
+    $("#btn-apply-encrypt").textContent = enabled ? "Encrypted" : "Off";
+    setTimeout(() => $("#btn-apply-encrypt").textContent = "Apply", 1500);
+    if (enabled) alert("Encryption is on for new data. Keep data/secret.key safe — " +
+      "deleting it locks everything already encrypted.");
+    else alert("New data will be written unencrypted. Already-encrypted rows stay " +
+      "encrypted and need the key.");
+  }
+  refreshStatus();
+});
 $("#btn-apply-storage").addEventListener("click", async () => {
   const budgetMb = Number($("#cfg-budget").value || 0);
   const body = {
@@ -440,6 +459,7 @@ async function renderModelEditors() {
   if ($("#cfg-retention")) $("#cfg-retention").value = pc.media_retention_minutes ?? 0;
   if ($("#cfg-budget")) $("#cfg-budget").value = pc.media_budget_bytes ? Math.round(pc.media_budget_bytes / 1e6) : 0;
   if ($("#cfg-hourly-index")) $("#cfg-hourly-index").checked = !!pc.hourly_index;
+  if ($("#cfg-encrypt")) $("#cfg-encrypt").checked = !!(st.encryption && st.encryption.enabled);
   for (const stage of ["vision", "reasoning"]) {
     const c = cfg[stage] || {};
     const box = $(`#${stage}-model-editor`);

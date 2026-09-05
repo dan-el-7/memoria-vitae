@@ -24,7 +24,7 @@ from PIL import Image
 from ..config import PipelineConfig
 from ..providers.base import VisionProvider
 from ..store.db import RunStore
-from ..utils import clamp, ema, iso, utcnow_minus
+from ..utils import clamp, ema, iso, parse_iso, utcnow_minus
 from .change import ChangeDetector
 from .intake import Frame, FrameIntake
 from .perceive import flatten_observation, issue_count, perceive
@@ -82,6 +82,23 @@ def _top_confidence(vlm: dict[str, Any]) -> float | None:
     return max(confs) if confs else None
 
 
+def _ts_gap_seconds(a: str, b: str) -> float | None:
+    """Seconds from ISO timestamp a to b (None if either is unparseable)."""
+    try:
+        return (parse_iso(b) - parse_iso(a)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def _dominant_scene(scenes: list[str]) -> str | None:
+    """Most common non-empty scene label in an event (ties: first seen)."""
+    counts: dict[str, int] = {}
+    for s in scenes:
+        if s:
+            counts[s] = counts.get(s, 0) + 1
+    return max(counts, key=counts.get) if counts else None
+
+
 class PipelineWorker:
     def __init__(
         self,
@@ -117,6 +134,7 @@ class PipelineWorker:
         self._last_media_sweep_mono = 0.0
         self._last_index_sweep_mono = 0.0
         self._index_task: asyncio.Task[None] | None = None
+        self._event: dict[str, Any] | None = None  # open event segment (see _track_event)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -137,6 +155,10 @@ class PipelineWorker:
         if self._index_task is not None and not self._index_task.done():
             self._index_task.cancel()
         self._index_task = None
+        try:
+            self._flush_event()  # close the open event segment
+        except Exception:
+            pass
         self.status.running = False
 
     # --------------------------------------------------------------- input
@@ -259,6 +281,9 @@ class PipelineWorker:
             self._save_media(frame_id, obs_id, frame.jpeg, importance)
             self._enforce_media_budget()
 
+        # Derived, additive event tracking (scene runs split by time gaps).
+        self._track_event(obs_id, payload.get("timestamp") or iso(), vlm.get("scene"), importance)
+
         # Embedding runs once per COMMITTED observation — never per frame.
         await self._embed_observation(obs_id, payload)
 
@@ -276,6 +301,50 @@ class PipelineWorker:
         self._last_heartbeat_mono = time.monotonic()
 
     # ----------------------------------------------------------- internals
+
+    # ---- event segmentation (derived, additive) ----
+
+    def track_observation(self, obs_id: int, ts: str, scene: str | None,
+                          importance: int) -> None:
+        """Public hook so non-frame commits (voice notes) join events too."""
+        self._track_event(obs_id, ts, scene, importance)
+
+    def flush_event(self) -> None:
+        self._flush_event()
+
+    def _track_event(self, obs_id: int, ts: str, scene: str | None, importance: int) -> None:
+        if self._event is None:
+            self._event = {"start": ts, "last": ts, "n": 1,
+                           "scenes": [scene] if scene else [],
+                           "rep": (obs_id, importance)}
+            return
+        gap = _ts_gap_seconds(self._event["last"], ts)
+        duration = _ts_gap_seconds(self._event["start"], ts)
+        if (gap is None or gap > self.cfg.event_gap_minutes * 60
+                or duration is None or duration > self.cfg.event_max_minutes * 60):
+            self._flush_event()
+            self._event = {"start": ts, "last": ts, "n": 1,
+                           "scenes": [scene] if scene else [],
+                           "rep": (obs_id, importance)}
+            return
+        self._event["last"] = ts
+        self._event["n"] += 1
+        if scene:
+            self._event["scenes"].append(scene)
+        if importance > self._event["rep"][1]:
+            self._event["rep"] = (obs_id, importance)
+
+    def _flush_event(self) -> None:
+        ev = self._event
+        self._event = None
+        if not ev:
+            return
+        title = _dominant_scene(ev["scenes"]) or f"{ev['n']} observation(s)"
+        self.store.add_event(
+            start_ts=ev["start"], end_ts=ev["last"], title=title,
+            n_obs=ev["n"], rep_obs_id=ev["rep"][0],
+        )
+        self.store.add_metric("event_built", 1, {"n_obs": ev["n"]})
 
     def _observation_text(self, payload: dict[str, Any]) -> str:
         """Flat text summary embedded for semantic retrieval."""
@@ -406,7 +475,7 @@ class PipelineWorker:
                 img.thumbnail((max_side, max_side))
             buf = io.BytesIO()
             img.convert("RGB").save(buf, format="JPEG", quality=self.cfg.media_jpeg_quality)
-            data = buf.getvalue()
+            data = self.store.encrypt_media(buf.getvalue())  # at-rest encryption (no-op if off)
             digest = hashlib.sha256(data).hexdigest()[:16]
             rel = f"media/obs{obs_id:06d}_i{importance}_{digest}.jpg"
             path = self.run_dir / rel

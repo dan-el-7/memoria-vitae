@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 
 from ..providers.base import ToolSpec
 from ..runs.manager import Run
+from ..store.db import RunStore
 
 # --- tool specs sent to the model -------------------------------------------
 
@@ -73,6 +74,39 @@ GET_TIMELINE_INDEX = ToolSpec(
             "start": {"type": "string", "description": "Optional ISO timestamp lower bound"},
             "end": {"type": "string", "description": "Optional ISO timestamp upper bound"},
         },
+    },
+)
+GET_EVENTS = ToolSpec(
+    name="get_events",
+    description="Return event segments: contiguous spans of related observations (scene runs "
+                "separated by time gaps), each with start/end, a short title, observation count "
+                "and the most important observation's id. The mid-level unit between raw "
+                "observations and the hourly timeline index — use to answer 'when was I at the "
+                "desk' or to pick a window before fetching rows.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "start": {"type": "string", "description": "Optional ISO timestamp lower bound"},
+            "end": {"type": "string", "description": "Optional ISO timestamp upper bound"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+        },
+    },
+)
+SEARCH_ALL_RUNS = ToolSpec(
+    name="search_all_runs",
+    description="Keyword-search across ALL runs stored on this machine (past runs AND the "
+                "current one). Use when the question may predate this run ('which day was I in "
+                "the garage?') or refers to another session. Results are read-only summaries "
+                "tagged with their run; observation ids are per-run, so drill down inside a run "
+                "only via that run's chat.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Keywords to match"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50,
+                      "description": "Max results per run (default 3)"},
+        },
+        "required": ["query"],
     },
 )
 GET_OBSERVATION_IMAGE = ToolSpec(
@@ -172,8 +206,9 @@ WRITE_FILE = ToolSpec(
 )
 
 ALL_TOOLS = [SEARCH_OBSERVATIONS, GET_OBSERVATIONS_IN_RANGE, GET_OBSERVATION,
-             GET_TIMELINE_INDEX, GET_OBSERVATION_IMAGE, GET_LOCATION_HISTORY, GET_RUN_STATS,
-             APPEND_NOTE, CREATE_REPORT, INSPECT_FRAME, READ_FILE, LIST_FILES, WRITE_FILE]
+             GET_TIMELINE_INDEX, GET_EVENTS, SEARCH_ALL_RUNS, GET_OBSERVATION_IMAGE,
+             GET_LOCATION_HISTORY, GET_RUN_STATS, APPEND_NOTE, CREATE_REPORT, INSPECT_FRAME,
+             READ_FILE, LIST_FILES, WRITE_FILE]
 
 
 @dataclass
@@ -181,6 +216,7 @@ class ToolContext:
     run: Run
     vision: Any = None  # VisionProvider, optional (inspect_frame disabled if None)
     embedder: Any = None  # EmbeddingProvider, optional (semantic mode disabled if None)
+    run_lookup: Any = None  # Callable[[], list[{run_id,name,db_path}]] for cross-run search
     max_file_bytes: int = 2_000_000
 
     def _resolve(self, rel: str, *, write: bool = False) -> Path:
@@ -256,6 +292,11 @@ async def _execute(ctx: ToolContext, name: str, args: dict[str, Any]) -> Any:
                     "note": "no hourly index available for this range; "
                             "use search_observations / get_observations_in_time_range"}
         return {"indexed_hours": len(hours), "hours": hours}
+    if name == "get_events":
+        return store.events_in_range(args.get("start"), args.get("end"),
+                                     limit=int(args.get("limit") or 100))
+    if name == "search_all_runs":
+        return await _search_all_runs(ctx, args)
     if name == "get_observation_image":
         return await _get_observation_image(ctx, args)
     if name == "get_location_history":
@@ -320,6 +361,50 @@ async def _search_observations(ctx: ToolContext, args: dict[str, Any]) -> Any:
     return store.search_observations(query, **kwargs)
 
 
+async def _search_all_runs(ctx: ToolContext, args: dict[str, Any]) -> Any:
+    """Keyword search across every run on this machine.
+
+    Read-only by construction: each run's store is opened fresh, queried with
+    its own FTS/LIKE path, and closed. Embeddings are deliberately NOT used —
+    embedding the query per-run is wasteful and keyword is the right tool for
+    locating which session a memory lives in.
+    """
+    if ctx.run_lookup is None:
+        raise RuntimeError("cross-run search is not available in this context")
+    query = str(args.get("query", "")).strip()
+    if not query:
+        raise ValueError("search_all_runs requires a query")
+    per_run = max(1, min(int(args.get("limit") or 3), 10))
+    results: list[dict[str, Any]] = []
+    for entry in ctx.run_lookup()[:20]:  # most recent runs first; keep the pass bounded
+        path = Path(entry["db_path"])
+        if not path.exists():
+            continue
+        try:
+            s = RunStore(path)
+        except Exception:
+            continue  # locked/corrupt run must not break the sweep
+        try:
+            hits = s.search_observations(query, limit=per_run)
+        finally:
+            s.close()
+        for h in hits:
+            results.append({
+                "run_id": entry["run_id"],
+                "run_name": entry.get("name"),
+                "id": h["id"],
+                "ts": h["ts"],
+                "local_ts": h.get("local_ts"),
+                "kind": h.get("kind"),
+                "importance": h.get("importance"),
+                "scene": h.get("scene"),
+                "summary": (h.get("summary") or "")[:300],
+            })
+    if not results:
+        return {"matches": 0, "note": "no run on this machine matched that query"}
+    return {"matches": len(results), "results": results[:40]}
+
+
 async def _get_observation_image(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     """Return the retained image for one observation; `_images_b64` is pulled
     out by the agent loop and attached to the conversation (never automatic)."""
@@ -338,7 +423,9 @@ async def _get_observation_image(ctx: ToolContext, args: dict[str, Any]) -> dict
     path = ctx.run.media_path(media_rel)
     if path is None or not path.exists():
         raise FileNotFoundError("media file missing on disk")
-    data = path.read_bytes()
+    data = ctx.run.read_media(media_rel)  # transparent at-rest decryption
+    if data is None:
+        raise FileNotFoundError("media file missing on disk")
     if len(data) > ctx.max_file_bytes:
         raise ValueError("media file exceeds the tool size cap")
     import base64
@@ -378,7 +465,9 @@ async def _inspect_frame(ctx: ToolContext, args: dict[str, Any]) -> dict[str, An
     if not media_rel:
         raise FileNotFoundError("this observation has no retained image (frame was not saved)")
     image_path = ctx.run.dir / media_rel
-    image_bytes = image_path.read_bytes()
+    if not image_path.exists():
+        raise FileNotFoundError("media file missing on disk")
+    image_bytes = ctx.run.read_media(media_rel)  # transparent at-rest decryption
     answer = await ctx.vision.inspect(image_bytes, str(args["question"]))
     return {"observation_id": obs["id"], "frame_path": media_rel, "answer": answer}
 
