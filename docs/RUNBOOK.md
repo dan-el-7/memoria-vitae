@@ -97,9 +97,9 @@ The verified debug artifact is:
 Build it with Android Studio JBR 21 and the cached Gradle 9.4.1 distribution:
 
 ```bat
-set JAVA_HOME=<Android Studio>\jbr
+set JAVA_HOME=D:\IDEs\Android Studio\jbr
 cd android
-gradle.bat assembleDebug
+C:\Users\HP\.gradle\wrapper\dists\gradle-9.4.1-bin\arn2x92ynaizyzdaamcbpbhtj\gradle-9.4.1\bin\gradle.bat assembleDebug
 ```
 
 Install with Android Studio or `adb install -r` from a machine with an attached

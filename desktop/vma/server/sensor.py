@@ -15,6 +15,28 @@ Server -> phone:
 - {"type":"status", "run_state":"running|degraded|paused|stopped", "models":...}
 - {"type":"error", "code":..., "message":...}
 
+Authentication (v2)
+-------------------
+After pairing, the phone holds (device_token, cr_secret). Connection flow:
+
+1. phone -> {"type":"hello", "token":..., "device":{...}, "cr": {"nonce": <client_nonce>}}
+   (``cr.nonce`` present = "I do challenge-response".)
+2. server verifies the token; if the device has a CR secret it replies
+   {"type":"auth_challenge","nonce": <server_nonce>}  and defers welcome.
+   A legacy phone (no cr field) gets the bearer-token welcome directly.
+3. phone -> {"type":"auth_response","nonce": <client_nonce>,
+             "response": HMAC-SHA256(cr_secret, "vma-auth-v1:<server_nonce>:<client_nonce>")}
+4. server verifies; both sides derive the session key
+   HKDF-SHA256(cr_secret, salt=<server_nonce>+<client_nonce>) and the server
+   sends {"type":"e2e_start"} — after which ALL control text frames are
+   hex-encoded AES-256-GCM sealed blobs and binary frame uploads are sealed
+   too. Unsealed traffic after e2e_start is rejected (downgrade protection).
+
+The long-lived secret never crosses the wire after pairing; a hostile relay
+sees only nonces, HMACs and ciphertext. Legacy devices (paired before v2)
+keep working with bearer-token hello — the dashboard shows the weaker auth
+level; they should re-pair on the LAN to upgrade.
+
 Backpressure: every ack carries `rec_interval_ms` (from the worker's EMA of
 VLM latency + network EMA). The phone adapts its capture timer; it also keeps
 at most one unacked frame in flight.
@@ -32,12 +54,20 @@ from typing import TYPE_CHECKING, Any
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ..pipeline.intake import Frame
-from ..utils import iso
+from ..security.auth_crypto import (
+    DIR_PHONE_TO_SERVER,
+    DIR_SERVER_TO_PHONE,
+    SealError,
+    SealedChannel,
+    derive_session_key,
+)
+from ..utils import iso, random_token
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..app import AppState
 
 MAGIC_HEADER_LEN = 4  # uint32 LE
+AUTH_WINDOW_S = 30.0  # must complete hello(+challenge) within this window
 
 
 def hello_authenticated(hub: "SensorHub") -> bool:
@@ -55,6 +85,7 @@ class SensorState:
     connected_since: str | None = None
     last_disconnect_ts: str | None = None
     transport: str = "lan"  # lan|relay
+    auth: str = "none"      # none|bearer|cr|cr+e2e
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +97,7 @@ class SensorState:
             "connected_since": self.connected_since,
             "last_disconnect_ts": self.last_disconnect_ts,
             "transport": self.transport,
+            "auth": self.auth,
         }
 
 
@@ -77,6 +109,12 @@ class SensorHub:
         self.sensors: SensorState = SensorState()
         self._ws: WebSocket | None = None
         self._lock = asyncio.Lock()
+        # Challenge-response state for the CURRENT connection.
+        self._cr_device_id: str | None = None
+        self._cr_server_nonce: str | None = None
+        self._cr_client_nonce: str | None = None
+        self._seal: SealedChannel | None = None
+        self._auth_deadline: float = 0.0
 
     @property
     def connected(self) -> bool:
@@ -91,9 +129,17 @@ class SensorHub:
             self._ws = ws
             self.sensors = SensorState(connected=True, transport=transport,
                                        connected_since=iso())
+            self._seal = None
+            self._cr_device_id = None
+            self._cr_server_nonce = None
+            self._cr_client_nonce = None
+            self._auth_deadline = time.monotonic() + AUTH_WINDOW_S
         hello_seen = False
         try:
             while True:
+                if not hello_seen and time.monotonic() > self._auth_deadline:
+                    await ws.close(code=4002, reason="authentication timeout")
+                    break
                 message = await ws.receive()
                 if message.get("type") == "websocket.disconnect":
                     break
@@ -117,6 +163,16 @@ class SensorHub:
     # ------------------------------------------------------------ handlers
 
     async def _on_control(self, ws: WebSocket, text: str, hello_seen: bool) -> bool:
+        # Unseal if the E2E layer is active.
+        if self._seal is not None:
+            try:
+                raw = self._seal.unseal(bytes.fromhex(text), DIR_PHONE_TO_SERVER)
+                text = raw.decode("utf-8")
+            except (ValueError, SealError) as exc:
+                await self._send(ws, {"type": "error", "code": "e2e_bad",
+                                      "message": f"sealed control frame rejected: {exc}"})
+                await ws.close(code=4003, reason="e2e integrity failure")
+                return False
         try:
             msg = json.loads(text)
         except json.JSONDecodeError:
@@ -135,18 +191,65 @@ class SensorHub:
             device = msg.get("device") or {}
             self.sensors.device_id = device_id
             self.sensors.device_info = device
-            run = self.state.current_run
-            await self._send(ws, {
-                "type": "welcome",
-                "run_id": run.id if run else None,
-                "run_state": self.state.run_state(),
-                "min_interval_ms": self.state.cfg.pipeline.min_interval_ms,
-                "heartbeat_s": self.state.cfg.pipeline.heartbeat_interval_s,
-            })
-            if run:
-                run.store.add_device_event("connect", {"device_id": self.sensors.device_id, "device": device})
-            await self.state.broadcast_ui()
+            self.sensors.auth = "bearer"
+            cr = msg.get("cr") or {}
+            client_nonce = str(cr.get("nonce") or "")
+            has_secret = self.state.pairing.cr_secret_for(device_id) is not None
+            if client_nonce and has_secret:
+                # v2 phone: challenge it, defer the welcome.
+                server_nonce = random_token(16)
+                self._cr_device_id = device_id
+                self._cr_server_nonce = server_nonce
+                self._cr_client_nonce = client_nonce
+                await self._send(ws, {"type": "auth_challenge", "nonce": server_nonce})
+                return hello_seen
+            if client_nonce and not has_secret:
+                # Phone supports CR but this desktop has no secret stored
+                # (paired pre-v2). Fall back to bearer for this connection;
+                # the phone should re-pair to upgrade.
+                pass
+            self._cr_device_id = None
+            self._cr_server_nonce = None
+            await self._welcome(ws, device)
             return True
+
+        if mtype == "auth_response":
+            if self._cr_device_id is None or self._cr_server_nonce is None:
+                await self._send(ws, {"type": "error", "code": "no_challenge",
+                                      "message": "no active challenge; send hello first"})
+                return hello_seen
+            client_nonce = str(msg.get("nonce") or "")
+            response = str(msg.get("response") or "")
+            if client_nonce != self._cr_client_nonce:
+                await self._send(ws, {"type": "error", "code": "auth_failed",
+                                      "message": "challenge nonce mismatch"})
+                await ws.close(code=4001, reason="authentication failed")
+                return hello_seen
+            if self.state.pairing.verify_challenge(self._cr_device_id, self._cr_server_nonce,
+                                                   client_nonce, response):
+                self.sensors.auth = "cr"
+                # E2E: derive the session key from the CR secret + both nonces.
+                secret = self.state.pairing.cr_secret_for(self._cr_device_id)
+                if secret is not None:
+                    session_key = derive_session_key(secret, self._cr_server_nonce, client_nonce)
+                    channel = SealedChannel(session_key)
+                    # Plaintext sentinel: everything AFTER this frame is sealed.
+                    # Must be sent before self._seal is armed so it stays clear.
+                    try:
+                        await ws.send_text(json.dumps({"type": "e2e_start"}))
+                    except Exception:
+                        pass
+                    self._seal = channel
+                    self.sensors.auth = "cr+e2e"
+                await self._welcome(ws, self.sensors.device_info)
+                self._cr_device_id = None
+                self._cr_server_nonce = None
+                return True
+            self.sensors.auth = "none"
+            await self._send(ws, {"type": "error", "code": "auth_failed",
+                                  "message": "challenge-response verification failed"})
+            await ws.close(code=4001, reason="authentication failed")
+            return hello_seen
 
         if mtype == "heartbeat":
             run = self.state.current_run
@@ -190,11 +293,33 @@ class SensorHub:
         await self._send(ws, {"type": "error", "code": "unknown_type", "message": f"unknown control type {mtype!r}"})
         return hello_seen
 
+    async def _welcome(self, ws: WebSocket, device: dict[str, Any]) -> None:
+        run = self.state.current_run
+        await self._send(ws, {
+            "type": "welcome",
+            "run_id": run.id if run else None,
+            "run_state": self.state.run_state(),
+            "min_interval_ms": self.state.cfg.pipeline.min_interval_ms,
+            "heartbeat_s": self.state.cfg.pipeline.heartbeat_interval_s,
+            "auth": self.sensors.auth,
+        })
+        if run:
+            run.store.add_device_event("connect", {"device_id": self.sensors.device_id, "device": device})
+        await self.state.broadcast_ui()
+
     async def _on_binary(self, ws: WebSocket, data: bytes) -> None:
         if not hello_authenticated(self):
             await self._send(ws, {"type": "error", "code": "not_authenticated",
                                   "message": "send hello with a valid device token first"})
             return
+        if self._seal is not None:
+            try:
+                data = self._seal.unseal(data, DIR_PHONE_TO_SERVER)
+            except SealError as exc:
+                await self._send(ws, {"type": "error", "code": "e2e_bad",
+                                      "message": f"sealed frame rejected: {exc}"})
+                await ws.close(code=4003, reason="e2e integrity failure")
+                return
         if len(data) < MAGIC_HEADER_LEN:
             return
         (header_len,) = struct.unpack_from("<I", data, 0)
@@ -245,7 +370,13 @@ class SensorHub:
 
     async def _send(self, ws: WebSocket, obj: dict[str, Any]) -> None:
         try:
-            await ws.send_text(json.dumps(obj, ensure_ascii=False))
+            text = json.dumps(obj, ensure_ascii=False)
+            if self._seal is not None:
+                # Sealed control frames go out as hex text (WS text frames).
+                blob = self._seal.seal(text.encode("utf-8"), DIR_SERVER_TO_PHONE)
+                await ws.send_text(blob.hex())
+            else:
+                await ws.send_text(text)
         except Exception:
             pass
 

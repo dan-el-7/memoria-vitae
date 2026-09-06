@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-MIRROR = Path(__file__).resolve().parent.parent / "android" / ".offline-m2"
+MIRROR = Path(r"C:\Users\HP\.zcode\workspace\default\android\.offline-m2")
 
 removed = 0
 fixed = 0

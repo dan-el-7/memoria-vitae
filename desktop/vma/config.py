@@ -182,4 +182,11 @@ def load_config(path: Path | None = None) -> AppConfig:
             if hasattr(cfg.server, k):
                 cur = getattr(cfg.server, k)
                 setattr(cfg.server, k, Path(v) if isinstance(cur, Path) else v)
+    # Environment overrides (scripting/launchers): VMA_RELAY_URL and
+    # VMA_RELAY_REG_TOKEN beat config.toml; VMA_RELAY_URL="" disables online
+    # mode for this run without touching the saved config.
+    if "VMA_RELAY_URL" in os.environ:
+        cfg.server.relay_url = os.environ["VMA_RELAY_URL"].strip()
+    if "VMA_RELAY_REG_TOKEN" in os.environ:
+        cfg.server.relay_reg_token = os.environ["VMA_RELAY_REG_TOKEN"].strip()
     return cfg

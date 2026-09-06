@@ -162,7 +162,7 @@ class SensorService : Service(), LifecycleOwner {
         val channelId = "vma_sensor"
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
-            NotificationChannel(channelId, "Memoria Vitae Sensor", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(channelId, "Visual Memory Sensor", NotificationManager.IMPORTANCE_LOW)
         )
         val notification: Notification = Notification.Builder(this, channelId)
             .setContentTitle("VMA Sensor active")
@@ -386,20 +386,28 @@ class SensorService : Service(), LifecycleOwner {
             StatusBus.publish(this, "error: not paired")
             return
         }
-        val host = DeviceStore.normalizeUrl(store.serverUrl)
-        if (host.isBlank()) {
-            StatusBus.publish(this, "error: no server URL")
-            return
+        val online = store.mode == "online" && store.hasRelayConfig
+        val url: String
+        if (online) {
+            url = "relay://${store.relayHost}:${store.relayPort}/${store.relayChannel}/${store.relayAttachSecret}"
+        } else {
+            val host = DeviceStore.normalizeUrl(store.serverUrl)
+            if (host.isBlank()) {
+                StatusBus.publish(this, "error: no server URL")
+                return
+            }
+            url = "ws://$host/ws/phone"
         }
-        val conn = SensorConnection(client, "ws://$host/ws/phone", token, deviceInfo(), object :
+        val conn = SensorConnection(client, url, token, deviceInfo(), object :
             SensorConnection.Events {
-            override fun onWelcome(runId: String?, minIntervalMs: Long, heartbeatS: Long) {
+            override fun onWelcome(runId: String?, minIntervalMs: Long, heartbeatS: Long, auth: String) {
                 reconnectAttempt = 0
+                val authNote = if (auth == "cr+e2e") " · end-to-end encrypted" else ""
                 if (runId == null) {
-                    StatusBus.publish(this@SensorService, "connected — no active run on desktop")
+                    StatusBus.publish(this@SensorService, "connected — no active run on desktop$authNote")
                 } else {
                     captureIntervalMs = maxOf(minIntervalMs, 250)
-                    StatusBus.publish(this@SensorService, "run $runId")
+                    StatusBus.publish(this@SensorService, "run $runId$authNote")
                 }
                 flushBuffer()
             }
@@ -432,8 +440,9 @@ class SensorService : Service(), LifecycleOwner {
             override fun onError(message: String) {
                 StatusBus.publish(this@SensorService, "server: $message")
             }
-        }, initialAckedSeq = globalLastAcked)
+        }, initialAckedSeq = globalLastAcked, crSecret = store.crSecret)
         connection = conn
+        conn.relayAttachSecretRefresh = { secret -> store.relayAttachSecret = secret }
         conn.connect()
         if (!first) flushBuffer()
     }

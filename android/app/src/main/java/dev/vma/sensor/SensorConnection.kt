@@ -8,14 +8,19 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
 
 /**
- * WebSocket connection to the desktop using the VMA sensor protocol:
- *  - text: JSON control messages (hello/welcome/ack/heartbeat/status/error)
- *  - binary: [u32-LE header length][JSON header][JPEG bytes]
+ * One sensor connection to the desktop, over either transport:
+ *  - LAN:        OkHttp WebSocket to ws://host/ws/phone
+ *  - Relay:      dial-out TCP to the vma_relay, envelope-framed (see
+ *                [RelayConnection]); wrapped here so the service sees one API.
+ *
+ * v2 authentication runs INSIDE the phone→desktop protocol on both
+ * transports: hello carries a client nonce; the desktop challenges; the
+ * phone answers HMAC-SHA256(cr_secret, nonces) and both sides derive an
+ * AES-256-GCM session key. After e2e_start every control message and camera
+ * frame is sealed — the relay (and any LAN sniffer) sees only ciphertext.
  *
  * Reconnects with capped exponential backoff + jitter. Maintains at most ONE
  * unacked frame in flight (stop-and-wait) and adapts the capture interval to
@@ -28,9 +33,10 @@ class SensorConnection(
     private val deviceInfo: JSONObject,
     private val listener: Events,
     initialAckedSeq: Long = -1,
+    private val crSecret: String? = null,
 ) {
     interface Events {
-        fun onWelcome(runId: String?, minIntervalMs: Long, heartbeatS: Long)
+        fun onWelcome(runId: String?, minIntervalMs: Long, heartbeatS: Long, auth: String)
         fun onAck(seq: Long, verdict: String, recIntervalMs: Long)
         fun onRunStateChanged(active: Boolean)
         fun onConnectionState(state: String) // connecting|open|closed|failed
@@ -45,36 +51,44 @@ class SensorConnection(
         private set
     var recommendedIntervalMs: Long = 1000
         private set
+    var authLevel: String = "bearer"
+        private set
 
     private var ws: WebSocket? = null
+    private var relay: RelayConnection? = null
     private var closedByUser = false
     private var unackedSeq: Long = -1
     private var unackedSinceMs: Long = 0
+    private var clientNonce: String = ""
+    private var serverNonce: String = ""
+    private var seal: VmaCrypto.SealedSession? = null
+
+    // ----------------------------------------------------------- connect
 
     fun connect() {
         closedByUser = false
         listener.onConnectionState("connecting")
+        if (wsUrl.startsWith("relay://")) {
+            connectRelay()
+        } else {
+            connectWs()
+        }
+    }
+
+    private fun connectWs() {
         val request = Request.Builder().url(wsUrl).build()
         ws = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 connected = true
-                // The previous socket may have died with a frame in flight;
-                // stop-and-wait must not carry that stall into the new socket.
-                unackedSeq = -1
-                val hello = JSONObject()
-                    .put("type", "hello")
-                    .put("token", token)
-                    .put("device", deviceInfo)
-                webSocket.send(hello.toString())
-                listener.onConnectionState("open")
+                onTransportOpen { text -> webSocket.send(text) }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                try {
-                    handleControl(JSONObject(text))
-                } catch (e: Exception) {
-                    listener.onError("bad control message: ${e.message}")
-                }
+                onControlText(text)
+            }
+
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                onServerBinary(bytes.toByteArray())
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -91,8 +105,123 @@ class SensorConnection(
         })
     }
 
+    private fun connectRelay() {
+        val conn = RelayConnection(
+            wsUrl, token, deviceInfo, crSecret,
+            object : RelayConnection.Events {
+                override fun onAttached(send: (ByteArray) -> Unit) {
+                    connected = true
+                    onTransportOpen { text -> send(text.toByteArray(Charsets.UTF_8)) }
+                }
+
+                override fun onControl(text: String) = onControlText(text)
+
+                override fun onBinary(data: ByteArray) = onServerBinary(data)
+
+                override fun onState(state: String) {
+                    if (state.startsWith("open")) {
+                        // attached handled separately
+                    } else if (state == "secret-refreshed") {
+                        connected = false
+                        // Relay rotated the attach secret and dropped us;
+                        // reconnect now with the persisted new secret.
+                        listener.onConnectionState("relay secret refreshed — reconnecting")
+                        onRelaySecretRefreshed()
+                    } else {
+                        connected = false
+                        runActive = false
+                        listener.onConnectionState(state)
+                    }
+                }
+
+                override fun onError(message: String) = listener.onError(message)
+            },
+            onAttachSecretRefresh = { newSecret -> relayAttachSecretRefresh?.invoke(newSecret) },
+        )
+        relay = conn
+        conn.connect()
+    }
+
+    /** Relay handed back a rotated attach secret — reconnect immediately. */
+    fun onRelaySecretRefreshed() {
+        relay = null
+        connected = false
+        connect()
+    }
+
+    /** Optional hook so the service can persist relay secret rotations. */
+    var relayAttachSecretRefresh: ((String) -> Unit)? = null
+
+    // ------------------------------------------------- shared protocol
+
+    /** Transport is up: reset state and send hello (with CR nonce if v2). */
+    private fun onTransportOpen(sendText: (String) -> Unit) {
+        unackedSeq = -1
+        seal = null
+        authLevel = "bearer"
+        clientNonce = VmaCrypto.nonce()
+        val hello = JSONObject()
+            .put("type", "hello")
+            .put("token", token)
+            .put("device", deviceInfo)
+        if (!crSecret.isNullOrBlank()) {
+            hello.put("cr", JSONObject().put("nonce", clientNonce))
+        }
+        sendText(hello.toString())
+        listener.onConnectionState("open")
+    }
+
+    fun onControlText(text: String) {
+        try {
+            val key = seal
+            val plaintext: String = if (key != null) {
+                if (!VmaCrypto.isHex(text)) {
+                    // Plaintext after e2e_start is either an error frame or a
+                    // downgrade attempt — surface it, never parse sealed data as JSON.
+                    val probe = JSONObject(text)
+                    if (probe.optString("type") == "error") {
+                        listener.onError(probe.optString("message", "server error"))
+                        return
+                    }
+                    listener.onError("unsealed control frame after e2e_start")
+                    return
+                }
+                val pt = key.unseal(VmaCrypto.hexToBytes(text), fromPhone = false) ?: run {
+                    listener.onError("e2e integrity failure")
+                    hardClose()
+                    return
+                }
+                String(pt, Charsets.UTF_8)
+            } else text
+            handleControl(JSONObject(plaintext))
+        } catch (e: Exception) {
+            listener.onError("bad control message: ${e.message}")
+        }
+    }
+
     private fun handleControl(msg: JSONObject) {
         when (msg.optString("type")) {
+            "auth_challenge" -> {
+                serverNonce = msg.optString("nonce")
+                if (crSecret.isNullOrBlank()) {
+                    listener.onError("desktop demanded challenge-response; re-pair to upgrade")
+                    hardClose()
+                    return
+                }
+                val response = VmaCrypto.authResponse(crSecret, serverNonce, clientNonce)
+                sendControl(JSONObject()
+                    .put("type", "auth_response")
+                    .put("nonce", clientNonce)
+                    .put("response", response)
+                    .toString())
+            }
+            "e2e_start" -> {
+                if (!crSecret.isNullOrBlank()) {
+                    seal = VmaCrypto.SealedSession(
+                        VmaCrypto.deriveSessionKey(crSecret, serverNonce, clientNonce))
+                    authLevel = "cr+e2e"
+                }
+            }
             "welcome" -> {
                 runActive = !msg.isNull("run_id") && msg.optString("run_id").isNotBlank()
                 val min = msg.optLong("min_interval_ms", 250)
@@ -101,6 +230,7 @@ class SensorConnection(
                     if (msg.isNull("run_id")) null else msg.optString("run_id"),
                     min,
                     msg.optLong("heartbeat_s", 30),
+                    msg.optString("auth", authLevel),
                 )
             }
             "ack" -> {
@@ -116,9 +246,116 @@ class SensorConnection(
                 runActive = msg.optString("run_state") in setOf("running", "degraded", "paused")
                 if (runActive != wasActive) listener.onRunStateChanged(runActive)
             }
+            "pong" -> {}
             "error" -> listener.onError(msg.optString("message", "unknown"))
         }
     }
+
+    /** Binary from the server (sealed, or plaintext ack/status frames pre-e2e). */
+    fun onServerBinary(data: ByteArray) {
+        val key = seal ?: return
+        val pt = key.unseal(data, fromPhone = false) ?: run {
+            listener.onError("e2e integrity failure (binary)")
+            hardClose()
+            return
+        }
+        // Desktop never sends binary control today; if it starts, it is JSON.
+        try {
+            handleControl(JSONObject(String(pt, Charsets.UTF_8)))
+        } catch (_: Exception) {
+        }
+    }
+
+    // ----------------------------------------------------------- sending
+
+    private fun sendControl(text: String) {
+        val s = seal
+        if (s != null) {
+            sendBytes(s.seal(text.toByteArray(Charsets.UTF_8), phoneToServer = true))
+        } else {
+            sendTextRaw(text)
+        }
+    }
+
+    private fun sendTextRaw(text: String): Boolean {
+        val w = ws
+        if (w != null) return w.send(text)
+        val r = relay
+        if (r != null) {
+            r.sendText(text)
+            return true
+        }
+        return false
+    }
+
+    private fun sendBytes(data: ByteArray): Boolean {
+        val w = ws
+        if (w != null) return w.send(data.toByteString())
+        val r = relay
+        if (r != null) {
+            r.sendBytes(data)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Send one frame. Returns false if the transport is down, the desktop has
+     * no active run, or a previous frame is still unacked (caller skips).
+     */
+    fun sendFrame(frame: PendingFrame): Boolean {
+        if (!connected || !runActive || unackedSeq != -1L) return false
+        val payload = VmaCrypto.buildFramePayload(
+            frame.seq, frame.tsDeviceUtc, frame.width, frame.height, frame.jpeg, frame.gps)
+        val s = seal
+        val ok = if (s != null) {
+            val sealed = s.seal(payload, phoneToServer = true)
+            sendBytes(sealed)
+        } else {
+            sendBytes(payload)
+        }
+        if (ok) {
+            unackedSeq = frame.seq
+            unackedSinceMs = System.currentTimeMillis()
+        }
+        return ok
+    }
+
+    fun sendHeartbeat(gps: Map<String, Any?>?) {
+        val msg = JSONObject().put("type", "heartbeat").put("ts", isoUtcNow())
+        if (gps != null) msg.put("gps", JSONObject(gps))
+        sendControl(msg.toString())
+    }
+
+    fun sendCommand(command: String, args: JSONObject) {
+        sendControl(JSONObject()
+            .put("type", "command")
+            .put("command", command)
+            .put("args", args)
+            .toString())
+    }
+
+    private fun hardClose() {
+        try {
+            ws?.close(4003, "e2e integrity failure")
+            relay?.close()
+        } catch (_: Exception) {
+        }
+        ws = null
+        relay = null
+        connected = false
+    }
+
+    fun close() {
+        closedByUser = true
+        ws?.close(1000, "user stop")
+        relay?.close()
+        ws = null
+        relay = null
+        connected = false
+    }
+
+    // ------------------------------------------------------- stop-and-wait
 
     /** True while a sent frame has not been acked (stop-and-wait gate). */
     fun hasUnacked(): Boolean = unackedSeq != -1L
@@ -133,45 +370,6 @@ class SensorConnection(
      */
     fun clearUnacked() {
         unackedSeq = -1
-    }
-
-    /**
-     * Send one frame. Returns false if the socket is down, the desktop has no
-     * active run, or a previous frame is still unacked (caller skips capture).
-     */
-    fun sendFrame(frame: PendingFrame): Boolean {
-        val socket = ws
-        if (socket == null || !connected || !runActive || unackedSeq != -1L) return false
-        val header = JSONObject()
-            .put("seq", frame.seq)
-            .put("ts_device", frame.tsDeviceUtc)
-            .put("w", frame.width)
-            .put("h", frame.height)
-        if (frame.gps != null) header.put("gps", JSONObject(frame.gps))
-        val headerBytes = header.toString().toByteArray(Charsets.UTF_8)
-        val lenPrefix = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-            .putInt(headerBytes.size).array()
-        val payload = lenPrefix + headerBytes + frame.jpeg
-        val ok = socket.send(payload.toByteString())
-        if (ok) {
-            unackedSeq = frame.seq
-            unackedSinceMs = System.currentTimeMillis()
-        }
-        return ok
-    }
-
-    fun sendHeartbeat(gps: Map<String, Any?>?) {
-        val socket = ws ?: return
-        val msg = JSONObject().put("type", "heartbeat").put("ts", isoUtcNow())
-        if (gps != null) msg.put("gps", JSONObject(gps))
-        socket.send(msg.toString())
-    }
-
-    fun close() {
-        closedByUser = true
-        ws?.close(1000, "user stop")
-        ws = null
-        connected = false
     }
 
     companion object {

@@ -15,9 +15,15 @@ object StatusBus {
     }
 }
 
-/** HTTP pairing call: POST http://host:port/api/pair {"code","device_name"} -> token. */
+/** HTTP pairing call: POST http://host/api/pair {"code","device_name"} -> token. */
 object PairingClient {
-    data class Result(val ok: Boolean, val token: String?, val deviceId: String?, val error: String?)
+    data class Result(
+        val ok: Boolean,
+        val token: String?,
+        val deviceId: String?,
+        val crSecret: String?,
+        val error: String?,
+    )
 
     fun pair(serverUrl: String, code: String, deviceName: String): Result {
         return try {
@@ -36,13 +42,41 @@ object PairingClient {
                 ?.bufferedReader()?.use { it.readText() } ?: ""
             if (codeHttp in 200..299) {
                 val json = JSONObject(text)
-                Result(true, json.optString("token"), json.optString("device_id"), null)
+                Result(true, json.optString("token"), json.optString("device_id"),
+                       json.optString("cr_secret"), null)
             } else {
                 val msg = try { JSONObject(text).optString("detail") } catch (_: Exception) { text.take(120) }
-                Result(false, null, null, "HTTP $codeHttp: $msg")
+                Result(false, null, null, null, "HTTP $codeHttp: $msg")
             }
         } catch (e: Exception) {
-            Result(false, null, null, e.message ?: "network error")
+            Result(false, null, null, null, e.message ?: "network error")
+        }
+    }
+
+    /** Announce this phone so the desktop human can approve it (mutual flow). */
+    fun requestPairing(serverUrl: String, deviceName: String): Result {
+        return try {
+            val host = DeviceStore.normalizeUrl(serverUrl)
+            val url = URL("http://$host/api/pair/request")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            val body = JSONObject().put("device_name", deviceName)
+            conn.outputStream.use { out: OutputStream -> out.write(body.toString().toByteArray()) }
+            val codeHttp = conn.responseCode
+            val text = (if (codeHttp in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() } ?: ""
+            if (codeHttp in 200..299) {
+                Result(true, null, null, null, null)
+            } else {
+                val msg = try { JSONObject(text).optString("detail") } catch (_: Exception) { text.take(120) }
+                Result(false, null, null, null, "HTTP $codeHttp: $msg")
+            }
+        } catch (e: Exception) {
+            Result(false, null, null, null, e.message ?: "network error")
         }
     }
 }

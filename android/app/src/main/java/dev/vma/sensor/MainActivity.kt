@@ -34,6 +34,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -50,6 +52,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
@@ -122,6 +125,10 @@ class MainActivity : androidx.activity.ComponentActivity() {
     private val screenBlacked = mutableStateOf(false)
     private val menuOpen = mutableStateOf(false)
     private val confirmUnpair = mutableStateOf(false)
+    private val modeText = mutableStateOf("lan")           // lan | online
+    private val approvalRequested = mutableStateOf(false)
+    private val nearbyDesktops = mutableStateOf<List<VmaNsdHelper.Desktop>>(emptyList())
+    private var nsdHelper: VmaNsdHelper? = null
 
     private data class RunEntry(val id: String, val label: String)
     private data class ObsEntry(val id: Int, val time: String, val importance: Int,
@@ -161,6 +168,7 @@ class MainActivity : androidx.activity.ComponentActivity() {
         serverUrlText.value = store.serverUrl
         keepAwake.value = store.keepAwake
         keepAwakePowerSave.value = store.keepAwakePowerSave
+        modeText.value = store.mode
         pendingDeepLink = intent
         setContent { VmaTheme { VmaApp() } }
     }
@@ -168,6 +176,31 @@ class MainActivity : androidx.activity.ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleDeepLink(intent)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        nsdHelper?.stop()
+        nsdHelper = null
+    }
+
+    /** Browse for desktops advertising _vma._tcp on this Wi-Fi. */
+    private fun startNsdDiscovery() {
+        if (nsdHelper == null) {
+            nsdHelper = VmaNsdHelper(this).apply {
+                onUpdate = {
+                    runOnUiThread {
+                        nearbyDesktops.value = found.values.sortedBy { it.desktopName }
+                    }
+                }
+            }
+        }
+        nsdHelper?.start()
+    }
+
+    private fun stopNsdDiscovery() {
+        nsdHelper?.stop()
+        nearbyDesktops.value = emptyList()
     }
 
     override fun onResume() {
@@ -201,7 +234,25 @@ class MainActivity : androidx.activity.ComponentActivity() {
         val host = data.getQueryParameter("host") ?: return
         val code = data.getQueryParameter("code")
         tabIndex.value = 2
-        serverUrlText.value = host
+        // Online QR: mode=online&relay=..&rport=..&channel=..&attach=..
+        if (data.getQueryParameter("mode") == "online") {
+            val relayHost = data.getQueryParameter("relay") ?: ""
+            val relayPort = data.getQueryParameter("rport")?.toIntOrNull() ?: 8765
+            val channel = data.getQueryParameter("channel") ?: ""
+            val attach = data.getQueryParameter("attach") ?: ""
+            if (relayHost.isNotBlank() && channel.isNotBlank()) {
+                store.relayHost = relayHost
+                store.relayPort = relayPort
+                store.relayChannel = channel
+                store.relayAttachSecret = attach
+                store.mode = "online"
+                modeText.value = "online"
+            }
+        } else {
+            serverUrlText.value = host
+            store.mode = "lan"
+            modeText.value = "lan"
+        }
         if (!code.isNullOrBlank()) {
             pairingCodeText.value = code
             if (!store.isPaired) pair()
@@ -230,11 +281,41 @@ class MainActivity : androidx.activity.ComponentActivity() {
                 if (result.ok && !result.token.isNullOrBlank()) {
                     store.deviceToken = result.token
                     store.deviceId = result.deviceId
-                    message.value = "Paired ✓ — start sensing from the Sensor tab"
+                    if (!result.crSecret.isNullOrBlank()) {
+                        store.crSecret = result.crSecret
+                    } else {
+                        store.crSecret = null  // legacy desktop: bearer auth only
+                    }
+                    val e2e = if (!result.crSecret.isNullOrBlank()) " · end-to-end encrypted ready" else ""
+                    message.value = "Paired ✓$e2e — start sensing from the Sensor tab"
                 } else {
                     message.value = "Pairing failed: ${result.error}"
                 }
                 paired.value = store.isPaired
+            }
+        }.start()
+    }
+
+    /** Mutual-approval flow: ask the desktop human to approve this phone. */
+    private fun requestApproval() {
+        val serverUrl = serverUrlText.value.trim()
+        if (serverUrl.isEmpty()) {
+            message.value = "Enter the desktop URL first"
+            return
+        }
+        store.serverUrl = serverUrl
+        busy.value = "request"
+        Thread {
+            val result = PairingClient.requestPairing(serverUrl, "${Build.MANUFACTURER} ${Build.MODEL}")
+            runOnUiThread {
+                busy.value = null
+                if (result.ok) {
+                    message.value = "Approval requested — the desktop operator must approve, " +
+                        "then you'll get a code to enter here"
+                    approvalRequested.value = true
+                } else {
+                    message.value = "Request failed: ${result.error}"
+                }
             }
         }.start()
     }
@@ -911,13 +992,97 @@ class MainActivity : androidx.activity.ComponentActivity() {
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text("Connect to your desktop", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(
-                value = serverUrlText.value,
-                onValueChange = { serverUrlText.value = it },
-                label = { Text("Desktop URL (e.g. 192.168.1.10:8619)") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
+
+            // ------------------------------------------ mode toggle
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = modeText.value == "lan",
+                    onClick = { modeText.value = "lan"; store.mode = "lan" },
+                    label = { Text("Same Wi-Fi (LAN)") },
+                )
+                FilterChip(
+                    selected = modeText.value == "online",
+                    onClick = { modeText.value = "online"; store.mode = "online" },
+                    label = { Text("Online (relay)") },
+                )
+            }
+
+            if (modeText.value == "lan") {
+                // ------------------------------------ nearby desktops
+                Text("Nearby desktops on this Wi-Fi", style = MaterialTheme.typography.titleSmall)
+                Button(onClick = { startNsdDiscovery() }, enabled = busy.value == null) {
+                    Text(if (nearbyDesktops.value.isEmpty()) "Scan for desktops" else "Rescan")
+                }
+                if (nearbyDesktops.value.isEmpty()) {
+                    Text(
+                        "No desktops found yet. Make sure the desktop app is running and both " +
+                            "devices are on the same Wi-Fi, then scan.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                nearbyDesktops.value.forEach { desk ->
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(desk.desktopName, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    if (desk.pairingLive) "ready to pair" else "locked",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (desk.pairingLive) Color(0xFF3ECF8E) else Color(0xFF9BA3B2),
+                                )
+                            }
+                            Text(
+                                "${desk.host}:${desk.port}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Button(onClick = {
+                                serverUrlText.value = "${desk.host}:${desk.port}"
+                                store.serverUrl = serverUrlText.value
+                            }) { Text("Use this desktop") }
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = serverUrlText.value,
+                    onValueChange = { serverUrlText.value = it },
+                    label = { Text("…or desktop URL (e.g. 192.168.1.10:8619)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+            } else {
+                // ---------------------------------------- online mode
+                Text(
+                    "Online mode routes through your relay: works from any network, " +
+                        "end-to-end encrypted, survives internet drops with the offline buffer.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (store.hasRelayConfig) {
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text("Relay configured", fontWeight = FontWeight.Bold)
+                            Text(
+                                "${store.relayHost}:${store.relayPort} · channel ${store.relayChannel.take(10)}…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                } else {
+                    Text(
+                        "No relay configured — scan the desktop's ONLINE pairing QR " +
+                            "(shown when its relay is connected).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
             OutlinedTextField(
                 value = pairingCodeText.value,
                 onValueChange = { pairingCodeText.value = it.uppercase() },
@@ -933,14 +1098,27 @@ class MainActivity : androidx.activity.ComponentActivity() {
                 if (busy.value == "pair") CircularProgressIndicator(modifier = Modifier.size(24.dp))
                 else Text("Pair")
             }
+            if (modeText.value == "lan") {
+                OutlinedButton(
+                    onClick = { requestApproval() },
+                    enabled = busy.value == null,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (busy.value == "request") CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                    else Text("Request approval instead (no code needed)")
+                }
+            }
             Text(
                 if (paired.value) {
-                    "Paired as ${store.deviceId ?: "?"} → ${store.serverUrl}\n\n" +
-                        "Pairing is permanent: tokens never expire until you revoke the device in the " +
+                    val auth = if (!store.crSecret.isNullOrBlank()) "challenge-response + E2E encryption" else "bearer token (re-pair to upgrade)"
+                    "Paired as ${store.deviceId ?: "?"} → " +
+                        (if (modeText.value == "online") "relay ${store.relayHost}" else store.serverUrl) +
+                        "\nAuth: $auth\n\n" +
+                        "Pairing is permanent: credentials never expire until you revoke the device in the " +
                         "desktop dashboard. If the desktop's IP changes, re-scan its QR to update the address."
                 } else {
                     "Not paired. Scan the desktop's pairing QR with this phone's camera app — it opens " +
-                        "here with everything filled in — or type the address and code manually."
+                        "here with everything filled in — or find a nearby desktop above."
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,

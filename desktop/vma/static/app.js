@@ -60,6 +60,92 @@ async function generatePairingCode(force = false) {
   if (qr) qr.src = `/api/pairing/qr.svg?t=${Date.now()}`;
 }
 
+async function refreshPairingRequests() {
+  const list = $("#pairing-requests-list");
+  if (!list) return;
+  try {
+    const requests = await (await fetch("/api/pair/requests")).json();
+    if (!Array.isArray(requests) || !requests.length) {
+      list.textContent = "none";
+      return;
+    }
+    list.innerHTML = "";
+    for (const req of requests) {
+      const row = document.createElement("div");
+      row.className = "pairing-request-row";
+      const label = document.createElement("span");
+      label.textContent = `${req.device_name} · ${req.age_s}s ago`;
+      const approve = document.createElement("button");
+      approve.textContent = "Approve";
+      approve.onclick = async () => {
+        const r = await fetch("/api/pair/approve", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request_id: req.request_id }),
+        });
+        if (r.ok) {
+          const data = await r.json();
+          $("#pairing-code").textContent = data.code || "—";
+          $("#pairing-expiry").textContent = "approved — give this code to the phone";
+          await refreshPairingRequests();
+        }
+      };
+      const deny = document.createElement("button");
+      deny.textContent = "Deny";
+      deny.className = "secondary";
+      deny.onclick = async () => {
+        await fetch("/api/pair/deny", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request_id: req.request_id }),
+        });
+        await refreshPairingRequests();
+      };
+      row.append(label, approve, deny);
+      list.append(row);
+    }
+  } catch {
+    list.textContent = "none";
+  }
+}
+
+async function loadRelayConfig() {
+  const urlInput = $("#relay-url-input");
+  const tokenInput = $("#relay-token-input");
+  if (!urlInput) return;
+  try {
+    const cfg = await (await fetch("/api/config/relay")).json();
+    if (document.activeElement !== urlInput) urlInput.value = cfg.relay_url || "";
+    tokenInput.placeholder = cfg.relay_reg_token_set
+      ? "registration token (set — leave blank to keep)"
+      : "registration token";
+    const status = $("#relay-config-status");
+    if (status) {
+      status.textContent = cfg.relay_url
+        ? (cfg.connected ? `connected · ${cfg.status}` : `not connected · ${cfg.status}`)
+        : "online mode off (LAN only)";
+    }
+  } catch { /* server not up yet */ }
+}
+
+async function saveRelayConfig(disable = false) {
+  const url = disable ? "" : ($("#relay-url-input")?.value || "").trim();
+  const token = ($("#relay-token-input")?.value || "").trim();
+  const body = disable ? { relay_url: "" } : { relay_url: url };
+  if (token) body.relay_reg_token = token;   // empty input keeps the saved token
+  const r = await fetch("/api/config/relay", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const status = $("#relay-config-status");
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    if (status) status.textContent = `save failed: ${err.detail || r.status}`;
+    return;
+  }
+  if (!disable) $("#relay-token-input").value = "";   // don't keep the secret on screen
+  await loadRelayConfig();
+  refreshStatus();
+}
+
 async function copyPairingAddress() {
   const address = pairingAddresses[0];
   if (!address) return;
@@ -125,8 +211,23 @@ function renderStatus(st) {
     ? `${ph.device_id} · last seq ${ph.last_seq}` : "";
   const relay = st.relay || {};
   $("#relay-info").textContent = relay.configured
-    ? `Relay: ${relay.status}${relay.channel_id ? ` · ${relay.channel_id}` : ""}`
+    ? `Relay: ${relay.status}${relay.channel_id ? ` · ${relay.channel_id}` : ""}` +
+      (relay.hosted ? " · hosted in-app" : "")
     : "Relay: disabled";
+  const disc = st.discovery || {};
+  const di = $("#discovery-info");
+  if (di) {
+    di.textContent = disc.advertised
+      ? `Discoverable on this Wi-Fi as “${disc.name || disc.instance}” — phones can find this desktop in the app`
+      : "Not discoverable on the LAN (zeroconf unavailable) — pair by address/QR";
+  }
+  if (ph.connected && ph.auth) {
+    const authNote = ph.auth === "cr+e2e"
+      ? "auth: challenge-response · end-to-end encrypted"
+      : ph.auth === "cr" ? "auth: challenge-response"
+      : ph.auth === "bearer" ? "auth: bearer token (re-pair to upgrade)" : "";
+    if (authNote) $("#phone-info").textContent += ` · ${authNote}`;
+  }
 
   const p = st.pipeline;
   $("#pipeline-stats").textContent = p
@@ -180,6 +281,8 @@ $("#btn-unload-vision").addEventListener("click", () => modelAction("/api/models
 $("#btn-unload-reasoning").addEventListener("click", () => modelAction("/api/models/reasoning/unload"));
 $("#btn-copy-address").addEventListener("click", copyPairingAddress);
 $("#btn-new-code").addEventListener("click", () => generatePairingCode(true));
+$("#btn-save-relay").addEventListener("click", () => saveRelayConfig(false));
+$("#btn-disable-relay").addEventListener("click", () => saveRelayConfig(true));
 
 /* ------------------------- storage policy card ------------------------- */
 $("#btn-apply-encrypt").addEventListener("click", async () => {
@@ -571,5 +674,8 @@ async function renderModelEditors() {
   await refreshRunsInto($("#chat-run-select"));
   connectUiSocket();
   setInterval(refreshStatus, 5000);
+  setInterval(refreshPairingRequests, 5000);
+  setInterval(loadRelayConfig, 5000);
+  loadRelayConfig();
   setInterval(() => { refreshRunsInto($("#obs-run-select")); refreshRunsInto($("#chat-run-select")); }, 15000);
 })();

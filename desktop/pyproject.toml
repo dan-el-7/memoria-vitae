@@ -10,6 +10,7 @@ dependencies = [
     "pillow>=11.0",
     "websockets>=13.0",
     "cryptography>=43.0",
+    "zeroconf>=0.140",
 ]
 
 [project.optional-dependencies]

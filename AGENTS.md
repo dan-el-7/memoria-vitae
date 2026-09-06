@@ -38,7 +38,7 @@ Design pillars (do not break these without asking):
 
 ## Repo layout
 
-| Path | What it is | ( human input, note: this structure was zcode's internal directory and can vary on different setups and os, ask if doubtful or check in case of missing files, repo structure itself will likely line up but the directory it's located in may differ)
+| Path | What it is | (the repo root directory can vary between machines)
 |---|---|
 | `desktop/` | Python package `vma` — FastAPI app, pipeline, providers, store, agent, security, stt. `.venv` lives here. `config.toml` is auto-saved by the UI at runtime. `data/` (or `VMA_DATA_DIR`) holds `devices.json` + `runs/`. |
 | `desktop/vma/pipeline/` | `intake.py` (bounded queue + seq dedup), `change.py` (64×48 MAD + dHash gate), `perceive.py` (schema + prompt), `worker.py` (consumer loop, media policy/budget/retention, embeddings, metrics). |
@@ -66,9 +66,9 @@ cd desktop && .venv\Scripts\python -m pytest ..\tests -q
 desktop\.venv\Scripts\python tools\synthetic_phone.py --folder <imgs> --code <PAIRING_CODE>
 
 :: Android APK (offline build; needs JAVA_HOME set to Android Studio's JBR)
-set "JAVA_HOME=<Android Studio>\jbr"
+set "JAVA_HOME=D:\IDEs\Android Studio\jbr"
 cd android
-gradle.bat assembleDebug --offline
+C:\Users\HP\.gradle\wrapper\dists\gradle-9.4.1-bin\arn2x92ynaizyzdaamcbpbhtj\gradle-9.4.1\bin\gradle.bat assembleDebug --offline
 :: output: android\app\build\outputs\apk\debug\app-debug.apk
 ```
 
@@ -216,3 +216,68 @@ v0.2.2 features (2026-09-06):
   trigger must mirror the insert trigger exactly or the FTS index corrupts.
   Payload ciphertext prefix `enc1:`, media files `VMAENC1:`. Legacy plaintext
   rows stay readable; tests must not assume key availability.
+
+Connectivity + auth v2 (2026-09-06):
+
+- **Two pairing modes, both first-class**: LAN (same Wi-Fi) and Online
+  (relay). The phone's Connect tab switches with FilterChips; the QR carries
+  `mode=online&relay&rport&channel&attach` when the desktop's relay is
+  connected, so online phones never need the LAN address.
+- **Discovery**: desktop advertises `_vma._tcp.local.` (zeroconf, optional
+  dep — absent zeroconf leaves pairing by IP/QR intact). zeroconf must be
+  started via `run_in_executor` from the FastAPI lifespan, NOT directly in
+  the running loop (instantiating it in-loop fails with an empty exception).
+  Android browses via framework `NsdManager` (no new deps). TXT keys:
+  `v`/`id`/`name`/`pair` (pair=1 while a code is live).
+- **Mutual approval**: phones can POST /api/pair/request without a code; the
+  dashboard lists pending requests with Approve/Deny. Approving hands out
+  the current single-use code; the phone then completes normal pairing.
+- **Challenge-response + E2E (do not weaken)**: pairing returns
+  `cr_secret` alongside the token; the desktop persists the SHA-256 token
+  hash and the CR secret Fernet-sealed under `data/auth.key`. On connect the
+  phone sends hello with `cr.nonce`, the desktop challenges, the phone
+  answers HMAC-SHA256 over both nonces, and both sides derive an AES-256-GCM
+  session key (HKDF-SHA256, salt = server+client nonces, info `vma-e2e-v1`).
+  After the PLAINTEXT `e2e_start` sentinel, all control text frames are
+  hex-sealed and binary frames are sealed — the `e2e_start` frame itself
+  MUST be sent before `self._seal` is armed on the server or the phone can't
+  parse it. GCM nonces embed per-direction monotonic counters; receivers
+  reject counter regressions (replay). Legacy pre-v2 devices fall back to
+  bearer auth (auth level shown in UI; re-pair upgrades them).
+- **Relay v2**: phones attach with a per-channel attach secret (returned to
+  the desktop at registration; the desktop re-presents it on reconnect so
+  blips don't rotate it; a previous secret stays valid for a 600s grace
+  window; rotation answers the phone with `attach_secret_refresh` and DROPS
+  the connection — never continue a handshake mid-stream or the wire
+  desyncs). `wait_for_desktop` parks a phone ≤300s. Keepalive ping/pong
+  every 25s, dead-peer reap ~75s, desktop-less channels persist 15 min.
+  RelayClient's adapter `close()` must close the TCP socket (a forwarded
+  close frame goes to the phone; without closing, SensorHub.handle hangs).
+- Verified live: tests/live_e2e_v2.py (relay→CR→E2E over real sockets) and
+  tests/live_ws_v2.py (FastAPI + WS phone through the full v2 handshake);
+  both must stay green when the auth path changes.
+- **Online mode is asked at boot AND live-configurable**: run_desktop.bat /
+  run_desktop.sh run a host-aware wizard (vma.set_relay --wizard) when no
+  relay is configured — option 1 suggests `tcp://<lan-ip>:8765` (relay on
+  this machine, auto-hosted, see below), option 2 takes a VPS address.
+  The ask never repeats (persisted to config.toml); skipped when
+  VMA_RELAY_URL is exported. The dashboard pairing card has a relay config
+  editor (POST/GET /api/config/relay) that applies LIVE — it cancels/
+  recreates the relay-client task without a restart and persists to
+  config.toml; the GET never echoes the token (only "set"). Env overrides
+  (VMA_RELAY_URL, VMA_RELAY_REG_TOKEN) beat config.toml for that run (empty
+  VMA_RELAY_URL = LAN-only for that run). AppState carries `relay_task`
+  (boot or live-restarted) and shutdown cancels both. Verified by
+  tests/live_relay_config.py.
+- **Local relay URLs are auto-hosted in-process** (vma/server/relay_host.py):
+  when relay_url's host is this machine (loopback or own LAN IP), the app
+  runs the relay itself (asyncio server on 0.0.0.0:<relay port> from the
+  URL, config reg token) — no run_relay.bat to remember, no
+  connection-refused state. If the port is already in use, hosting is
+  skipped and the external relay is used as-is. Applies at boot and via the
+  live config endpoint; `status.relay.hosted` + "hosted in-app" in the
+  dashboard; shutdown stops it. Verified by tests/live_hosted_relay.py.
+- **Bat-file rule**: never put literal `(` `)` in echo/set-prompt lines
+  inside parenthesized blocks — cmd closes the block early (". was
+  unexpected at this time."). Keep interactive prompting in Python (the
+  wizard), not in batch.

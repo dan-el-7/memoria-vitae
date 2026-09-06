@@ -33,10 +33,15 @@ async def test_relay_register_attach_and_forward() -> None:
             "role": "desktop", "channel_id": "desk_test_channel", "token": "secret"
         })
         registered = json.loads((await desktop_reader.readline()).decode("utf-8"))
-        assert registered == {"type": "registered", "channel_id": "desk_test_channel"}
+        assert registered["type"] == "registered"
+        assert registered["channel_id"] == "desk_test_channel"
+        attach_secret = registered["attach_secret"]
+        assert attach_secret
 
         phone_reader, phone_writer = await asyncio.open_connection("127.0.0.1", port)
-        await send_handshake(phone_writer, {"role": "phone", "channel_id": "desk_test_channel"})
+        await send_handshake(phone_writer, {
+            "role": "phone", "channel_id": "desk_test_channel", "attach_secret": attach_secret
+        })
         attached = json.loads((await phone_reader.readline()).decode("utf-8"))
         assert attached == {"type": "attached", "channel_id": "desk_test_channel"}
 
@@ -88,7 +93,90 @@ async def test_relay_rejects_bad_registration_token() -> None:
         await server.wait_closed()
 
 
+@pytest.mark.asyncio
+async def test_relay_rejects_phone_with_bad_attach_secret() -> None:
+    """A guessed channel id alone must not get a phone attached."""
+    relay = RelayServer("127.0.0.1", 0, reg_token="secret")
+    server = await asyncio.start_server(relay.handle_client, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    desktop_writer: asyncio.StreamWriter | None = None
+    try:
+        desktop_reader, desktop_writer = await asyncio.open_connection("127.0.0.1", port)
+        await send_handshake(desktop_writer, {
+            "role": "desktop", "channel_id": "desk_test_channel", "token": "secret"
+        })
+        await desktop_reader.readline()  # registered
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await send_handshake(writer, {
+            "role": "phone", "channel_id": "desk_test_channel", "attach_secret": "wrong"
+        })
+        error = json.loads((await reader.readline()).decode("utf-8"))
+        assert error["type"] == "error"
+        assert "attach secret" in error["message"]
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        if desktop_writer is not None and not desktop_writer.is_closing():
+            desktop_writer.close()
+            await desktop_writer.wait_closed()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_relay_phone_waits_for_desktop_and_attaches() -> None:
+    """Offline resilience: a phone may arrive before the desktop re-registers."""
+    relay = RelayServer("127.0.0.1", 0, reg_token="secret")
+    server = await asyncio.start_server(relay.handle_client, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    desktop_writer: asyncio.StreamWriter | None = None
+    phone_writer: asyncio.StreamWriter | None = None
+    try:
+        # Desktop registers once to create the channel + attach secret.
+        desktop_reader, desktop_writer = await asyncio.open_connection("127.0.0.1", port)
+        await send_handshake(desktop_writer, {
+            "role": "desktop", "channel_id": "desk_wait_channel", "token": "secret"
+        })
+        registered = json.loads((await desktop_reader.readline()).decode("utf-8"))
+        attach_secret = registered["attach_secret"]
+        # Desktop drops (network blip).
+        desktop_writer.close()
+        await desktop_writer.wait_closed()
+        await asyncio.sleep(0.1)
+
+        # Phone connects while the desktop is offline and parks.
+        phone_reader, phone_writer = await asyncio.open_connection("127.0.0.1", port)
+        await send_handshake(phone_writer, {
+            "role": "phone", "channel_id": "desk_wait_channel",
+            "attach_secret": attach_secret, "wait_for_desktop": True,
+        })
+        await asyncio.sleep(0.3)  # parked, no handshake line yet
+
+        # Desktop comes back, presenting the SAME attach secret (continuity).
+        desktop_reader, desktop_writer = await asyncio.open_connection("127.0.0.1", port)
+        await send_handshake(desktop_writer, {
+            "role": "desktop", "channel_id": "desk_wait_channel", "token": "secret",
+            "attach_secret": attach_secret,
+        })
+        re_registered = json.loads((await desktop_reader.readline()).decode("utf-8"))
+        assert re_registered["attach_secret"] == attach_secret  # not rotated
+
+        # Parked phone gets attached automatically.
+        attached = json.loads((await phone_reader.readline()).decode("utf-8"))
+        assert attached == {"type": "attached", "channel_id": "desk_wait_channel"}
+        kind, payload = await asyncio.wait_for(read_envelope(desktop_reader), timeout=2)
+        assert kind == KIND_EVENT
+        assert json.loads(payload)["event"] == "phone_attached"
+    finally:
+        for writer in (phone_writer, desktop_writer):
+            if writer is not None and not writer.is_closing():
+                writer.close()
+                await writer.wait_closed()
+        server.close()
+        await server.wait_closed()
+
+
 async def _write_envelope(writer: asyncio.StreamWriter, kind: bytes, payload: bytes) -> None:
     writer.write(len(payload + kind).to_bytes(4, "big") + kind + payload)
     await writer.drain()
-

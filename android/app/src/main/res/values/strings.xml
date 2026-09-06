@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Memoria Vitae</string>
+    <string name="app_name">VMA Sensor</string>
     <string name="server_url_hint">Desktop URL (e.g. 192.168.1.10:8619)</string>
     <string name="pairing_code_hint">Pairing code (from desktop UI)</string>
     <string name="pair">Pair</string>

@@ -1,6 +1,6 @@
 # VMA architecture
 
-Memoria Vitae (internal short name: vma) treats the Android phone as a remote visual
+Visual Memory & Analysis Agent (VMA) treats the Android phone as a remote visual
 sensor. The desktop owns the run, inference, storage, pairing, and operator UI.
 
 ```text

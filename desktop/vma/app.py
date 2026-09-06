@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import os
 import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -53,6 +54,9 @@ class AppState:
         self.relay_channel_id: str | None = None
         self.relay_connected = False
         self.relay_status = "disabled"
+        self.relay_attach_secret: str | None = None
+        self.relay_client: Any | None = None
+        self.discovery: Any | None = None
         self._fernet = _load_fernet(cfg.server.data_dir, cfg.server.encrypt_observations)
         if self._fernet is not None:
             self.run_manager.set_fernet(self._fernet)
@@ -152,6 +156,13 @@ class AppState:
                 "connected": self.relay_connected,
                 "status": self.relay_status,
                 "channel_id": self.relay_channel_id,
+                "attach_secret": self.relay_attach_secret,
+                "hosted": bool(getattr(self, "hosted_relay", None)
+                               and self.hosted_relay.running),
+            },
+            "discovery": {
+                "advertised": bool(self.discovery and self.discovery._zc is not None),
+                "instance": getattr(self.discovery, "instance_id", None),
             },
             "pipeline": self.worker.status.to_dict() if self.worker else None,
             "intake": self.worker.intake.stats.to_dict() if self.worker else None,
@@ -319,6 +330,66 @@ def get_state() -> AppState:
 async def lifespan(app: FastAPI):
     global state
     cfg = load_config()
+    # Single-instance guard: two servers sharing port 8619 split traffic
+    # between different in-memory states (pairing lands on one process, the
+    # phone's connection on the other -> "unknown device token"). Refuse to
+    # start if another instance holds the lock.
+    lock_path = cfg.server.data_dir / "server.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if lock_path.exists():
+            pid = lock_path.read_text(encoding="utf-8").strip()
+            if pid and _process_alive(int(pid)):
+                print(f"[startup] REFUSING TO START: another VMA desktop (PID {pid}) "
+                      f"is running. Close it first (or kill PID {pid}).")
+                raise SystemExit(3)
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"[startup] lock check failed ({exc}) — continuing anyway")
+    try:
+        agen = _lifespan_inner(app, cfg)
+        await agen.__anext__()
+        try:
+            yield
+        finally:
+            try:
+                await agen.__anext__()
+            except StopAsyncIteration:
+                pass
+    finally:
+        try:
+            if lock_path.exists() and lock_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                lock_path.unlink()
+        except OSError:
+            pass
+
+
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except ImportError:
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+async def _lifespan_inner(app: FastAPI, cfg: AppConfig) -> None:
+    global state
     state = AppState(cfg)
     state.sensor = SensorHub(state)
     app.state.vma = state
@@ -330,17 +401,63 @@ async def lifespan(app: FastAPI):
 
     task = asyncio.create_task(status_loop(), name="ui-status-loop")
     # Relay client (M4): started only when configured; never blocks startup.
+    # When the relay URL points at THIS machine, host the relay in-process
+    # first (no run_relay.bat to remember) and let the client dial 127.0.0.1.
     relay_task = None
     if cfg.server.relay_url:
         try:
+            from .server.relay_host import HostedRelay, parse_relay_endpoint, relay_is_local
+            if relay_is_local(cfg.server.relay_url):
+                rhost, rport = parse_relay_endpoint(cfg.server.relay_url)
+                hosted = HostedRelay("0.0.0.0", rport, cfg.server.relay_reg_token)
+                if await hosted.start():
+                    state.hosted_relay = hosted
+        except Exception as exc:  # relay is optional infrastructure
+            print(f"[relay-host] failed: {exc}")
+        try:
             from .server.relay_client import RelayClient
-            relay_task = asyncio.create_task(RelayClient(state).run(), name="relay-client")
+            rc = RelayClient(state)
+            state.relay_client = rc
+            relay_task = asyncio.create_task(rc.run(), name="relay-client")
+            state.relay_task = relay_task
         except Exception as exc:  # relay is optional infrastructure
             print(f"[relay] failed to start: {exc}")
+    # mDNS LAN discovery (optional; pairing by IP/QR still works without it).
+    # zeroconf runs its own event loop + threads and must NOT be instantiated
+    # inside the server's running loop — run registration in an executor.
+    async def start_discovery() -> None:
+        try:
+            import asyncio as _aio
+            from .security.discovery import DiscoveryAdvertiser, desktop_instance_id
+            adv = DiscoveryAdvertiser(port=cfg.server.port,
+                                      desktop_name=_desktop_name(),
+                                      instance_id=desktop_instance_id(cfg.server.data_dir))
+            started = await _aio.get_running_loop().run_in_executor(None, adv.start)
+            if started:
+                state.discovery = adv
+        except Exception as exc:
+            print(f"[discovery] failed to start: {exc}")
+
+    asyncio.create_task(start_discovery(), name="mdns-discovery")
     yield
     task.cancel()
     if relay_task:
         relay_task.cancel()
+    live_relay_task = getattr(state, "relay_task", None)
+    if live_relay_task is not None and live_relay_task is not relay_task:
+        live_relay_task.cancel()
+    hosted = getattr(state, "hosted_relay", None)
+    if hosted is not None:
+        try:
+            await hosted.stop()
+        except Exception:
+            pass
+        state.hosted_relay = None
+    if state.discovery is not None:
+        try:
+            state.discovery.stop()
+        except Exception:
+            pass
     # Shutdown is one of the sanctioned unload moments.
     for prov in (state.vision, state.reasoning):
         if isinstance(prov, OllamaProvider):
@@ -376,11 +493,22 @@ async def health() -> dict[str, str]:
 
 # --------------------------------------------------------------- pairing
 
+def _desktop_name() -> str:
+    import platform
+    return f"{platform.node() or 'VMA Desktop'}"
+
+
 @app.get("/api/pairing/code")
 async def new_pairing_code(force: bool = False) -> dict[str, Any]:
     st = get_state()
     code = None if force else st.pairing.current_code()
-    return {"code": code or st.pairing.new_code(), "expires_in_s": 600}
+    code_value = code or st.pairing.new_code()
+    if st.discovery is not None:
+        try:
+            st.discovery.set_pairing_live(True)
+        except Exception:
+            pass
+    return {"code": code_value, "expires_in_s": 600}
 
 
 @app.get("/api/pairing/info")
@@ -388,11 +516,26 @@ async def pairing_info() -> dict[str, Any]:
     st = get_state()
     port = st.cfg.server.port
     _, ranked = _lan_address_candidates()
-    return {
+    info: dict[str, Any] = {
         "local_url": f"http://localhost:{port}",
         "lan_urls": [f"http://{address}:{port}" for address in ranked],
         "port": port,
+        "discovery": {
+            "advertised": bool(st.discovery and st.discovery._zc is not None),
+            "instance": getattr(st.discovery, "instance_id", None),
+            "name": _desktop_name(),
+        },
     }
+    if st.cfg.server.relay_url and st.relay_connected and st.relay_channel_id:
+        # Online pairing payload: the phone dials the RELAY directly and never
+        # needs the desktop's address. attach_secret comes from registration.
+        relay_url = st.cfg.server.relay_url
+        info["online"] = {
+            "relay_url": relay_url,
+            "channel_id": st.relay_channel_id,
+            "attach_secret": st.relay_attach_secret or "",
+        }
+    return info
 
 
 @app.get("/api/pairing/qr.svg")
@@ -409,8 +552,19 @@ async def pairing_qr_svg() -> Response:
     _, ranked = _lan_address_candidates()
     host = f"{ranked[0]}:{port}" if ranked else f"localhost:{port}"
     code = st.pairing.current_code() or st.pairing.new_code()
+    online: dict[str, str] | None = None
+    if st.cfg.server.relay_url and st.relay_connected and st.relay_channel_id:
+        from urllib.parse import urlparse
+        parsed = urlparse(st.cfg.server.relay_url if "://" in st.cfg.server.relay_url
+                          else f"tcp://{st.cfg.server.relay_url}")
+        online = {
+            "relay_host": parsed.hostname or "",
+            "relay_port": str(parsed.port or 8765),
+            "channel_id": st.relay_channel_id,
+            "attach_secret": st.relay_attach_secret or "",
+        }
     qr = qrcode.QRCode(border=2, box_size=8)
-    qr.add_data(pairing_uri(host, code))
+    qr.add_data(pairing_uri(host, code, online))
     qr.make(fit=True)
     buf = io.BytesIO()
     qr.make_image(image_factory=SvgPathImage).save(buf)
@@ -424,6 +578,42 @@ async def pair_device(body: dict[str, Any]) -> dict[str, Any]:
     if result is None:
         raise HTTPException(401, "invalid, expired or used pairing code")
     return result
+
+
+# --------------------------------------------------- mutual-approval pairing
+# Phone-initiated pairing: the phone announces itself; the desktop human
+# approves from the dashboard, then the phone completes with the code.
+
+
+@app.post("/api/pair/request")
+async def create_pairing_request(body: dict[str, Any]) -> dict[str, Any]:
+    """Phone-side 'I want to pair' — sits pending until a human approves."""
+    st = get_state()
+    return st.pairing.create_pairing_request(str(body.get("device_name", "")))
+
+
+@app.get("/api/pair/requests")
+async def list_pairing_requests() -> list[dict[str, Any]]:
+    return get_state().pairing.list_pending()
+
+
+@app.post("/api/pair/approve")
+async def approve_pairing_request(body: dict[str, Any]) -> dict[str, Any]:
+    st = get_state()
+    result = st.pairing.approve_request(str(body.get("request_id", "")))
+    if result is None:
+        raise HTTPException(404, "no such pending pairing request")
+    await st.broadcast_ui()
+    return result
+
+
+@app.post("/api/pair/deny")
+async def deny_pairing_request(body: dict[str, Any]) -> dict[str, Any]:
+    st = get_state()
+    if not st.pairing.deny_request(str(body.get("request_id", ""))):
+        raise HTTPException(404, "no such pending pairing request")
+    await st.broadcast_ui()
+    return {"denied": True}
 
 
 @app.get("/api/devices")
@@ -739,6 +929,81 @@ async def set_pipeline_config(body: dict[str, Any]) -> dict[str, Any]:
             st.worker.indexer.enabled = applied["hourly_index"]
     save_config_toml(st.cfg)
     return {"ok": True, "applied": applied}
+
+
+@app.post("/api/config/relay")
+async def set_relay_config(body: dict[str, Any]) -> dict[str, Any]:
+    """Configure the online (relay) mode live — no restart needed.
+
+    Accepts {"relay_url": "...", "relay_reg_token": "..."} (either optional;
+    empty url disables online mode). Cancels the current relay client task
+    and starts a fresh one so the change applies immediately; the config is
+    persisted to config.toml.
+    """
+    st = get_state()
+    url = str(body.get("relay_url") or "").strip()
+    token = str(body.get("relay_reg_token") or "").strip()
+    if "relay_url" in body:
+        if url and "://" in url and not url.split("://", 1)[0].lower() in ("tcp", "tls", "ssl", "https", "wss"):
+            raise HTTPException(400, "relay_url scheme must be tcp:// or tls:// (host:port also accepted)")
+        st.cfg.server.relay_url = url
+    if "relay_reg_token" in body:
+        st.cfg.server.relay_reg_token = token
+    save_config_toml(st.cfg)
+
+    # Restart the relay client task to pick up the new endpoint.
+    old = getattr(st, "relay_task", None)
+    if old is not None and not old.done():
+        old.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(old), timeout=2)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+    st.relay_task = None
+    st.relay_status = "disabled" if not st.cfg.server.relay_url else "starting"
+    st.relay_connected = False
+    if st.cfg.server.relay_url:
+        # Local relay URL -> host it in-process (mirrors the boot path).
+        try:
+            from .server.relay_host import HostedRelay, parse_relay_endpoint, relay_is_local
+            hosted = getattr(st, "hosted_relay", None)
+            if hosted is not None and hosted.running:
+                await hosted.stop()
+            st.hosted_relay = None
+            if relay_is_local(st.cfg.server.relay_url):
+                _, rport = parse_relay_endpoint(st.cfg.server.relay_url)
+                new_hosted = HostedRelay("0.0.0.0", rport, st.cfg.server.relay_reg_token)
+                if await new_hosted.start():
+                    st.hosted_relay = new_hosted
+        except Exception as exc:
+            print(f"[relay-host] failed: {exc}")
+        from .server.relay_client import RelayClient
+        rc = RelayClient(state=st)
+        st.relay_client = rc
+        st.relay_task = asyncio.create_task(rc.run(), name="relay-client")
+    else:
+        hosted = getattr(st, "hosted_relay", None)
+        if hosted is not None and hosted.running:
+            await hosted.stop()
+        st.hosted_relay = None
+    await st.broadcast_ui()
+    return {"ok": True, "relay_url": st.cfg.server.relay_url,
+            "relay_reg_token_set": bool(st.cfg.server.relay_reg_token)}
+
+
+@app.get("/api/config/relay")
+async def get_relay_config() -> dict[str, Any]:
+    """Current relay settings (token masked) for the dashboard card."""
+    st = get_state()
+    tok = st.cfg.server.relay_reg_token
+    return {
+        "relay_url": st.cfg.server.relay_url,
+        "relay_reg_token_set": bool(tok),
+        "relay_reg_token_hint": "set" if tok else "",
+        "connected": st.relay_connected,
+        "status": st.relay_status,
+        "channel_id": st.relay_channel_id,
+    }
 
 
 @app.post("/api/security/encryption")

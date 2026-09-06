@@ -3,6 +3,13 @@
 The relay connection is adapted to the same small interface used by
 ``SensorHub``. Phone control and binary frame payloads therefore stay on the
 existing `/ws/phone` protocol, including token authentication and acks.
+
+v2: the relay hands the desktop an **attach secret** at registration; the
+desktop persists it (``relay_attach_secret.json``) and presents it on
+re-registration so the secret survives network blips (a relay that sees the
+same channel + secret keeps it, rather than rotating). The QR/pairing payload
+for online mode carries relay host/channel/attach-secret so the phone can
+dial the relay directly — the phone never needs the desktop's LAN address.
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ class RelayClient:
     def __init__(self, state: Any) -> None:
         self.state = state
         self.channel_id = self._load_channel_id()
+        self.attach_secret = self._load_attach_secret()
 
     async def run(self) -> None:
         attempt = 0
@@ -45,11 +53,21 @@ class RelayClient:
                     "role": "desktop",
                     "channel_id": self.channel_id,
                     "token": self.state.cfg.server.relay_reg_token,
+                    "attach_secret": self.attach_secret,
+                    # Seed: if the relay restarted and lost its channel state,
+                    # it adopts this persisted secret instead of minting a new
+                    # one — phones holding the old secret keep working.
+                    "seed_attach_secret": self.attach_secret,
                 })
                 response = await asyncio.wait_for(reader.readline(), timeout=15)
                 hello = json.loads(response.decode("utf-8"))
                 if hello.get("type") != "registered":
                     raise RuntimeError(hello.get("message", "relay registration failed"))
+                if hello.get("attach_secret") and hello["attach_secret"] != self.attach_secret:
+                    # Relay rotated (first registration or restart): persist
+                    # the new secret so the next reconnect presents it.
+                    self.attach_secret = str(hello["attach_secret"])
+                    self._save_attach_secret(self.attach_secret)
                 attempt = 0
                 self._set_status("registered", connected=True)
                 adapter = RelayWebSocketAdapter(reader, writer)
@@ -87,6 +105,18 @@ class RelayClient:
         write_json(path, {"channel_id": value})
         self.state.relay_channel_id = value
         return value
+
+    def _load_attach_secret(self) -> str:
+        path = Path(self.state.cfg.server.data_dir) / "relay_attach_secret.json"
+        try:
+            return str(read_json(path).get("attach_secret") or "")
+        except (OSError, ValueError, AttributeError):
+            return ""
+
+    def _save_attach_secret(self, secret: str) -> None:
+        path = Path(self.state.cfg.server.data_dir) / "relay_attach_secret.json"
+        write_json(path, {"attach_secret": secret})
+        self.state.relay_attach_secret = secret
 
     def _set_status(self, status: str, connected: bool) -> None:
         self.state.relay_status = status
@@ -144,6 +174,12 @@ class RelayWebSocketAdapter:
                     # attach cleanly without leaving SensorHub marked online.
                     self.transport_closed = True
                     return {"type": "websocket.disconnect"}
+                if event.get("event") == "ping":
+                    # relay keepalive — reply pong so we aren't reaped
+                    try:
+                        await self._send_event("pong")
+                    except Exception:
+                        pass
                 continue
             if kind == KIND_JSON:
                 return {"type": "websocket.receive", "text": payload.decode("utf-8")}
@@ -169,7 +205,20 @@ class RelayWebSocketAdapter:
                                      separators=(",", ":")).encode("utf-8")
                 await _write_envelope(self.writer, KIND_CLOSE, payload)
             except Exception:
+                pass
+            finally:
+                # The SensorHub's receive loop blocks on this socket; a
+                # forwarded close frame goes to the phone, not us. Close the
+                # desktop side so handle() actually returns.
                 self.transport_closed = True
+                if not self.writer.is_closing():
+                    self.writer.close()
+
+    async def _send_event(self, event: str) -> None:
+        async with self._send_lock:
+            await _write_envelope(self.writer, KIND_EVENT,
+                                  json.dumps({"event": event},
+                                             separators=(",", ":")).encode("utf-8"))
 
 
 async def _write_line(writer: asyncio.StreamWriter, message: dict[str, Any]) -> None:

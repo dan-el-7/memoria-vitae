@@ -200,14 +200,26 @@ def lan_address_candidates() -> tuple[str | None, list[str]]:
     return primary, ranked
 
 
-def pairing_uri(host: str, code: str) -> str:
+def pairing_uri(host: str, code: str, online: dict[str, str] | None = None) -> str:
     """Payload encoded in the pairing QR; the Android app handles vma://pair.
 
     The vma:// scheme is what triggers the app's deep-link auto-pair, so it
     stays the primary payload; `url=` carries the plain http:// address for
     human readability in generic QR scanners.
+
+    `online` (optional): {relay_host, relay_port, channel_id, attach_secret}
+    — when present the phone pairs over the Internet relay instead of LAN.
     """
-    return f"vma://pair?host={host}&code={code}&url=http://{host}"
+    from urllib.parse import quote
+
+    uri = f"vma://pair?host={host}&code={code}&url=http://{host}"
+    if online:
+        uri += (f"&mode=online"
+                f"&relay={quote(online.get('relay_host', ''))}"
+                f"&rport={online.get('relay_port', '')}"
+                f"&channel={quote(online.get('channel_id', ''))}"
+                f"&attach={quote(online.get('attach_secret', ''))}")
+    return uri
 
 
 def write_json(path: Path, data: Any) -> None:

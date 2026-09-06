@@ -43,6 +43,7 @@
       <h3>Connect a phone</h3>
       <div id="phone-state" class="big">disconnected</div>
       <div id="phone-info" class="muted small"></div>
+      <div id="discovery-info" class="muted small"></div>
       <div class="pairing-note"><b>1. Put both devices on the same Wi-Fi.</b><br>
         Do not use <code>localhost</code> on the phone.</div>
       <div class="pairing-label">Desktop address to enter in Android</div>
@@ -57,8 +58,26 @@
       </div>
       <div class="pairing-label">3. Or scan this QR with the phone's camera</div>
       <img id="pairing-qr" alt="Pairing QR" width="190" height="190">
-      <div class="pairing-note">Scanning opens the VMA app with address + code filled in and pairs automatically. The code expires in 10 minutes and works once.</div>
+      <div class="pairing-note">Scanning opens the VMA app with address + code filled in and pairs automatically.
+        The code expires in 10 minutes and works once. When the relay is online the QR switches to
+        <b>online mode</b> (works from any network, end-to-end encrypted).</div>
       <div id="relay-info" class="muted small"></div>
+      <div class="pairing-label">Online mode (relay)</div>
+      <div class="pairing-note small">Route the phone through your relay server so it works from any
+        network — end-to-end encrypted, survives internet drops. Leave empty for LAN-only.</div>
+      <div class="editor-row">
+        <input id="relay-url-input" type="text" placeholder="relay host:port (e.g. tcp://myrelay.example.com:8765)">
+        <input id="relay-token-input" type="password" placeholder="registration token">
+      </div>
+      <div class="row">
+        <button id="btn-save-relay" class="secondary">Save relay settings</button>
+        <button id="btn-disable-relay" class="secondary">Disable online mode</button>
+      </div>
+      <div id="relay-config-status" class="muted small"></div>
+      <div id="pairing-requests">
+        <div class="pairing-label">Pairing requests waiting for your approval</div>
+        <div id="pairing-requests-list" class="muted small">none</div>
+      </div>
     </div>
 
     <div class="card">

@@ -136,3 +136,6 @@ code { background: var(--border); padding: 1px 6px; border-radius: 4px; }
 /* --- push-to-talk mic button --- */
 #btn-voice { font-size: 15px; padding: 7px 11px; }
 #btn-voice.recording { background: var(--err); animation: pulse 1.2s ease-in-out infinite; }
+
+.pairing-request-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+.pairing-request-row span { flex: 1 1 auto; min-width: 0; }

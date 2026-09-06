@@ -49,7 +49,7 @@ def test_probe_returns_none_or_a_routable_ip():
 
 def test_rank_adapters_uses_interface_names():
     ranked = vutils.rank_adapters([
-        ("vEthernet (Default Switch)", "172.27.128.9"),
+        ("vEthernet (Default Switch)", "172.27.128.1"),
         ("Wi-Fi", "10.0.0.7"),
         ("CloudflareWARP", "172.16.0.9"),
         ("Bluetooth Network Connection", "169.254.42.29"),

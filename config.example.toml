@@ -54,3 +54,10 @@ host = "127.0.0.1"                 # use 0.0.0.0 for trusted-LAN phone pairing
 port = 8619
 relay_url = ""                     # tcp://host:8765 for Internet pairing via relay/
 relay_reg_token = ""
+
+# --- online mode notes (2026-09-07) ------------------------------------
+# relay_url pointing at THIS machine (loopback or your own LAN IP) is
+# auto-hosted inside the desktop app — no separate relay process needed.
+# The run_desktop launcher asks once and can configure this for you.
+# A relay on a public server (VPS) is what makes phones on OTHER networks
+# (e.g. cellular) able to connect.
